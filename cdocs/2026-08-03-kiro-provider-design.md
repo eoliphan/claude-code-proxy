@@ -163,19 +163,40 @@ more before giving up, in case it rotated the token first.
 
 ## Error handling & retry
 
-`client.rs` mirrors `kimi/client.rs`'s loop shape (blocking `reqwest` client,
-`attempt_post` plus a retry loop) with Kiro-specific extensions:
+`client.rs` mirrors `kimi/client.rs`'s single-attempt-plus-classification shape,
+but the transport itself is **async** `reqwest::Client`, not Kimi's blocking
+client — Kiro's chunk-level timeout requirements (below) need per-chunk
+wall-clock timing that a blocking client can't give without extra thread
+plumbing. The retry *loop* itself lives one layer up, in `stream.rs`'s
+orchestration, since Kiro's retry budgets need to span multiple HTTP attempts
+plus the streaming read that follows each one — `client.rs` stays a
+single-attempt primitive that classifies each response, not a loop.
+
+Retry policy (revision note: this section originally called
+`INSUFFICIENT_MODEL_CAPACITY` non-retryable and left 429 handling to the
+existing shared `retry.rs` backoff. Both were corrected after the
+implementation plan's adversarial review surfaced that the actual upstream
+behavior — confirmed against the `pi-provider-kiro` reference — is more
+specific than that; the plan is the source of truth here now):
 
 - 401 **and** 403 both trigger one refresh-and-retry (Kiro uses 403 for some
-  auth races that Kimi doesn't hit)
-- 429 → existing shared backoff (`retry.rs::compute_backoff_delay`), unchanged
-- Non-retryable body markers (`MONTHLY_REQUEST_COUNT`,
-  `INSUFFICIENT_MODEL_CAPACITY`) are checked before any retry decision —
-  these are quota/capacity errors retrying won't fix, so they surface to the
-  client immediately instead of burning the retry budget
-- First-token-timeout and empty-stream retry live in `stream.rs` (the
-  *streaming* response stalling, not the initial POST) — one retry attempt
-  with a fresh connection, then surface the error
+  auth races that Kimi doesn't hit), sharing one retry budget with the
+  stall/empty-stream retries below
+- `INSUFFICIENT_MODEL_CAPACITY` **is** retried, but with its own separate,
+  dedicated budget (bounded, exponential backoff) distinct from the
+  auth/stall budget — this matches the actual reference implementation,
+  which retries capacity errors up to 3 times before giving up
+- `MONTHLY_REQUEST_COUNT` is genuinely non-retryable — quota exhaustion,
+  surfaced to the client immediately
+- Generic 429/5xx (not 401/403, not a capacity error) is **not** retried
+  internally by this provider at all — it's propagated immediately with any
+  `Retry-After` header forwarded, matching this codebase's existing Kimi
+  precedent and the reference's own behavior of never retrying a plain 429
+  inside the provider itself
+- First-token-timeout and idle-timeout retry live in `stream.rs` (the
+  *streaming* response stalling after a successful connection, not the
+  initial POST) — bounded retries sharing the same budget as the auth
+  retries above, then surface the error
 
 ## Testing
 
