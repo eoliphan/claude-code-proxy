@@ -45,11 +45,20 @@ pub struct KiroError {
     pub status: u16,
     pub message: String,
     pub body: Option<String>,
-    /// True only for 401/403 (auth) and capacity errors (see
-    /// `capacity_error`) — everything else, including generic 429/5xx, is
-    /// non-retryable *from this client's point of view* (Adversarial Review
-    /// Findings #14): it's propagated immediately, with `retry_after`
-    /// forwarded, rather than retried inside this provider.
+    /// True for: a transport-level failure (`status: 0`, e.g. connection
+    /// refused/DNS failure — retrying a fresh attempt may well succeed),
+    /// 401/403 (auth — retryable *after* a refresh, which this client never
+    /// attempts itself), and capacity errors (see `capacity_error`).
+    /// Everything else — generic 429/5xx and the other body-marker
+    /// classifications below — is non-retryable *from this client's point
+    /// of view* (Adversarial Review Findings #14): it's propagated
+    /// immediately, with `retry_after` forwarded, rather than retried
+    /// inside this provider.
+    ///
+    /// 401/403 is checked by status code *before* any body-marker
+    /// inspection, deliberately: a response coincidentally containing e.g.
+    /// `"MONTHLY_REQUEST_COUNT"` in its body alongside a 401 status is
+    /// still, unambiguously, an auth failure first.
     pub retryable: bool,
     /// True specifically for `INSUFFICIENT_MODEL_CAPACITY`. Task 15 tracks
     /// this against its own dedicated capacity-retry budget, distinct from
@@ -235,14 +244,7 @@ impl KiroHttpClient {
         // client needs, and reading it would be wasted work on the most
         // latency-sensitive error path.
         if status == 401 || status == 403 {
-            return Err(KiroError {
-                status,
-                message: format!("Kiro authentication failed ({status})"),
-                body: None,
-                retryable: true,
-                capacity_error: false,
-                retry_after: None,
-            });
+            return Err(auth_failure_error(status));
         }
 
         Err(classify_error_response(status, resp).await)
@@ -318,18 +320,32 @@ impl KiroHttpClient {
         };
 
         let status = resp.status().as_u16();
-        if !(200..300).contains(&status) {
-            return Err(classify_error_response(status, resp).await);
+        if (200..300).contains(&status) {
+            return resp.json::<Value>().await.map_err(|e| KiroError {
+                status,
+                message: "Failed to parse ListAvailableModels response".to_string(),
+                body: Some(e.to_string()),
+                retryable: false,
+                capacity_error: false,
+                retry_after: None,
+            });
         }
 
-        resp.json::<Value>().await.map_err(|e| KiroError {
-            status,
-            message: "Failed to parse ListAvailableModels response".to_string(),
-            body: Some(e.to_string()),
-            retryable: false,
-            capacity_error: false,
-            retry_after: None,
-        })
+        // Same 401/403-first precedence as `post_generate_assistant_response`
+        // (Adversarial Review, this task's own follow-up round): originally
+        // this method routed every non-2xx through `classify_error_response`
+        // uniformly, which meant a 401/403 here landed in that function's
+        // generic fallback (`retryable: false`) — silently contradicting
+        // `KiroError::retryable`'s documented contract that 401/403 is
+        // always retryable-after-refresh. Kept consistent across both
+        // methods now, even though today's only caller
+        // (`model_discovery.rs`, once retrofitted) treats this call as
+        // best-effort and may not act on `retryable` either way.
+        if status == 401 || status == 403 {
+            return Err(auth_failure_error(status));
+        }
+
+        Err(classify_error_response(status, resp).await)
     }
 
     /// Runs the synchronous, blocking `KiroAuthManager::get_auth` on a
@@ -360,10 +376,21 @@ impl KiroHttpClient {
     }
 }
 
+/// Builds the `Authorization: Bearer {token}` header value. Marked
+/// `set_sensitive(true)` so the token never shows up in `HeaderMap`/request
+/// `Debug` output (a real risk given this crate's traffic-capture and
+/// tracing machinery) and so HTTP/2 doesn't add it to the HPACK dynamic
+/// table for indexing. `HeaderValue::from_str` itself already rejects
+/// control characters (CR/LF in particular), so a malformed/malicious
+/// stored token can't smuggle extra headers via this path — it just fails
+/// with `InvalidHeaderValue`, mapped to a non-retryable `KiroError` by the
+/// caller.
 fn auth_header_value(
     access_token: &str,
 ) -> Result<HeaderValue, reqwest::header::InvalidHeaderValue> {
-    HeaderValue::from_str(&format!("Bearer {access_token}"))
+    let mut value = HeaderValue::from_str(&format!("Bearer {access_token}"))?;
+    value.set_sensitive(true);
+    Ok(value)
 }
 
 fn invalid_credentials_error(_: reqwest::header::InvalidHeaderValue) -> KiroError {
@@ -372,6 +399,22 @@ fn invalid_credentials_error(_: reqwest::header::InvalidHeaderValue) -> KiroErro
         message: "Stored access token is not a valid HTTP header value".to_string(),
         body: None,
         retryable: false,
+        capacity_error: false,
+        retry_after: None,
+    }
+}
+
+/// Shared 401/403 classification for both `post_generate_assistant_response`
+/// and `post_list_available_models`: no auto-refresh, no retry, `retryable:
+/// true` so a future outer retry loop (Task 15) knows a refresh-and-retry is
+/// worth attempting. The body is deliberately not read for this branch in
+/// either caller — see `post_generate_assistant_response`'s inline comment.
+fn auth_failure_error(status: u16) -> KiroError {
+    KiroError {
+        status,
+        message: format!("Kiro authentication failed ({status})"),
+        body: None,
+        retryable: true,
         capacity_error: false,
         retry_after: None,
     }
@@ -524,10 +567,22 @@ mod tests {
     /// tests need to exercise `next_chunk`'s per-call behavior. Mirrors the
     /// same "hand-roll a `TcpListener` for finer control" approach already
     /// used by `codex/auth/manager.rs`'s own tests for a similar reason.
-    fn spawn_chunked_mock_server(parts: Vec<(Duration, Vec<u8>)>) -> String {
+    /// Returns the mock server's URL and a `JoinHandle` for its background
+    /// thread. Callers that can afford to wait for the server to finish
+    /// writing (i.e. they drain the response to completion) should `.join()`
+    /// it, matching `codex/auth/manager.rs`'s own raw-`TcpListener` test
+    /// pattern (which always joins) rather than leaving the thread detached.
+    /// Callers that intentionally stop reading early (e.g. the timeout test
+    /// below, which only needs the *first* 50ms) may drop the handle instead
+    /// — `listener.accept()` still only blocks for a single connection, and
+    /// the thread exits on its own once that connection's writes finish or
+    /// the peer disconnects, well before the test process itself exits.
+    fn spawn_chunked_mock_server(
+        parts: Vec<(Duration, Vec<u8>)>,
+    ) -> (String, std::thread::JoinHandle<()>) {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
         let addr = listener.local_addr().unwrap();
-        std::thread::spawn(move || {
+        let handle = std::thread::spawn(move || {
             if let Ok((mut stream, _)) = listener.accept() {
                 let _ = test_http::read_http_request(&mut stream);
                 let total_len: usize = parts.iter().map(|(_, bytes)| bytes.len()).sum();
@@ -547,12 +602,12 @@ mod tests {
                 }
             }
         });
-        format!("http://{addr}")
+        (format!("http://{addr}"), handle)
     }
 
     #[tokio::test]
     async fn streaming_post_yields_chunks_incrementally() {
-        let url = spawn_chunked_mock_server(vec![
+        let (url, server) = spawn_chunked_mock_server(vec![
             (Duration::from_millis(10), b"{\"first\":true}".to_vec()),
             (Duration::from_millis(80), b"{\"second\":true}".to_vec()),
         ]);
@@ -566,30 +621,31 @@ mod tests {
         // Accumulate every `Bytes` outcome until `EndOfStream` rather than
         // asserting exact per-call chunk boundaries: TCP has no message
         // boundaries, so exactly how many bytes land in each `.chunk()` call
-        // is not a property this client controls or should be tested
-        // against — only that the two delayed writes surface as at least
-        // two separate `Bytes` outcomes (proving incremental delivery, not
-        // "wait for the whole body then return it once"), and that nothing
-        // is lost or reordered.
+        // — or even whether the two delayed writes ever surface as two
+        // *separate* outcomes, as opposed to one call happening to observe
+        // both after they're already buffered — is not a property this
+        // client controls or should be tested against (Adversarial Review:
+        // an earlier version of this test asserted `bytes_outcomes >= 2`,
+        // which is usually true given the write delays below but is not
+        // actually guaranteed by TCP/hyper, so it was dropped as a source of
+        // rare CI flakiness). What *is* guaranteed, and is what this test
+        // asserts: nothing is lost, corrupted, or reordered, and the stream
+        // correctly reaches `EndOfStream` once the full `Content-Length` has
+        // been delivered. `next_chunk_times_out_when_no_data_arrives_in_time`
+        // below is what actually proves bounded, incremental (not
+        // wait-for-the-whole-body) delivery.
         let generous_timeout = Duration::from_millis(2000);
         let mut received = Vec::new();
-        let mut bytes_outcomes = 0usize;
         loop {
             match stream.next_chunk(generous_timeout).await {
-                ChunkOutcome::Bytes(b) => {
-                    bytes_outcomes += 1;
-                    received.extend_from_slice(&b);
-                }
+                ChunkOutcome::Bytes(b) => received.extend_from_slice(&b),
                 ChunkOutcome::EndOfStream => break,
                 other => panic!("unexpected outcome while draining stream: {other:?}"),
             }
         }
 
         assert_eq!(received, b"{\"first\":true}{\"second\":true}");
-        assert!(
-            bytes_outcomes >= 2,
-            "expected the two delayed writes to surface as at least two separate chunks, got {bytes_outcomes}"
-        );
+        server.join().expect("mock server thread should not panic");
     }
 
     #[tokio::test]
@@ -602,7 +658,11 @@ mod tests {
         // as soon as its own 50ms elapses regardless of how long the server
         // thread sleeps afterward, so a larger margin here costs nothing at
         // runtime.
-        let url = spawn_chunked_mock_server(vec![(
+        // Deliberately not joined: this test only needs the first 50ms of
+        // behavior, and joining would mean waiting out the server's full 2s
+        // sleep for no additional signal (see `spawn_chunked_mock_server`'s
+        // doc comment for why dropping the handle here is safe).
+        let (url, _server) = spawn_chunked_mock_server(vec![(
             Duration::from_secs(2),
             b"{\"too\":\"late\"}".to_vec(),
         )]);
@@ -745,6 +805,32 @@ mod tests {
             1,
             "this client must not attempt any refresh-and-retry on its own"
         );
+    }
+
+    #[tokio::test]
+    async fn status_401_short_circuits_before_any_body_marker_check() {
+        // Regression lock (Adversarial Review, this task's own follow-up
+        // round): 401/403 is classified by status code *before* any
+        // body-marker inspection, by design (see `KiroError::retryable`'s
+        // doc comment) — a response that happens to carry a
+        // MONTHLY_REQUEST_COUNT-shaped body alongside a 401 status is still,
+        // unambiguously, an auth failure, not a non-retryable quota error.
+        let server = test_http::spawn_mock_server("mock server should be ready", |_req| {
+            test_http::json_response(401, r#"{"reason":"MONTHLY_REQUEST_COUNT"}"#)
+        });
+        let (client, _tmp) = test_client();
+
+        let err = client
+            .post_generate_assistant_response(&server.url, &serde_json::json!({}))
+            .await
+            .expect_err("401 is not success");
+
+        assert_eq!(err.status, 401);
+        assert!(
+            err.retryable,
+            "401 must win over any body marker, including MONTHLY_REQUEST_COUNT"
+        );
+        assert!(!err.capacity_error);
     }
 
     #[tokio::test]
@@ -993,5 +1079,30 @@ mod tests {
 
         assert_eq!(err.status, 500);
         assert!(!err.retryable);
+    }
+
+    #[tokio::test]
+    async fn list_available_models_401_is_retryable_with_no_auto_refresh() {
+        // Regression lock (Adversarial Review, this task's own follow-up
+        // round): this method must classify 401/403 the same way as
+        // `post_generate_assistant_response` (`retryable: true`, no second
+        // attempt) rather than falling through to `classify_error_response`'s
+        // generic non-retryable fallback.
+        let call_count = Arc::new(AtomicUsize::new(0));
+        let counter = call_count.clone();
+        let server = test_http::spawn_mock_server("mock server should be ready", move |_req| {
+            counter.fetch_add(1, Ordering::SeqCst);
+            test_http::json_response(401, r#"{"error":"unauthorized"}"#)
+        });
+        let (client, _tmp) = test_client();
+
+        let err = client
+            .post_list_available_models_impl(&far_future_creds(), Some(&server.url))
+            .await
+            .expect_err("401 is not success");
+
+        assert_eq!(err.status, 401);
+        assert!(err.retryable);
+        assert_eq!(call_count.load(Ordering::SeqCst), 1);
     }
 }
