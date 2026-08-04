@@ -377,9 +377,11 @@ mod tests {
 
     #[test]
     fn refresh_via_kiro_cli_times_out_without_hanging() {
-        // Regression test for Adversarial Review Findings #18: call a binary that exists
-        // but will take longer than our timeout, and assert the call returns `None` within
-        // a small bounded wall-clock time rather than hanging indefinitely.
+        use std::fs;
+
+        // Regression test for Adversarial Review Findings #18: verify the timeout/kill branch
+        // is actually exercised. Creates a fixture script that ignores all arguments and sleeps
+        // longer than the timeout, ensuring the deadline check and kill() call are reached.
         let tmp = TempDir::new().unwrap();
         let deps = crate::paths::DirResolverEnv {
             platform: "linux".to_string(),
@@ -387,14 +389,35 @@ mod tests {
             home: tmp.path().to_string_lossy().to_string(),
         };
 
+        // Create a fixture script that ignores arguments and sleeps 10s (longer than 100ms timeout)
+        let script_path = tmp.path().join("blocking_sleep.sh");
+        fs::write(&script_path, "#!/bin/sh\nsleep 10").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&script_path, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
         let start = std::time::Instant::now();
-        let result = refresh_with(&deps, "sleep", Duration::from_millis(100));
+        let result = refresh_with(
+            &deps,
+            script_path.to_str().unwrap(),
+            Duration::from_millis(100),
+        );
         let elapsed = start.elapsed();
 
-        assert!(result.is_none());
+        // Should return None (timeout occurred)
+        assert!(result.is_none(), "refresh should timeout and return None");
+
+        // Should have waited approximately the timeout duration (not instant, and not 10s)
         assert!(
-            elapsed < Duration::from_secs(3),
-            "refresh timed out, took {:?}",
+            elapsed >= Duration::from_millis(80),
+            "should have waited for timeout, took {:?}",
+            elapsed
+        );
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "should have killed process and returned quickly after timeout, took {:?}",
             elapsed
         );
     }
