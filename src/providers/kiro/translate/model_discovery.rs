@@ -213,7 +213,14 @@ pub async fn fetch_available_models(
 }
 
 /// Internal seam for testing, mirroring [`fetch_available_models_impl`].
-async fn fetch_available_profile_arn_impl(
+///
+/// `pub(crate)` rather than private because Task 15's stream orchestration
+/// resolves the profile ARN itself (it needs the resolved value to put in the
+/// outbound request body, and needs to re-resolve after invalidating the
+/// cache on a 401/403) and its own tests must be able to point that
+/// resolution at a mock server instead of the real
+/// `https://q.{region}.amazonaws.com` host.
+pub(crate) async fn fetch_available_profile_arn_impl(
     credentials: &KiroCredentials,
     base_url_override: Option<&str>,
 ) -> Result<Option<String>, anyhow::Error> {

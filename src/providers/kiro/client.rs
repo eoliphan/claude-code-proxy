@@ -147,12 +147,24 @@ impl KiroHttpClient {
     /// so unit tests never touch the real `~/.config/claude-code-proxy`
     /// paths.
     #[cfg(test)]
-    fn for_test(auth_manager: KiroAuthManager<FileAuthStore<KiroCredentials>>) -> Self {
+    pub(crate) fn for_test(auth_manager: KiroAuthManager<FileAuthStore<KiroCredentials>>) -> Self {
         Self::from_parts(reqwest::Client::new(), auth_manager)
     }
 
     pub fn auth_manager(&self) -> &KiroAuthManager<FileAuthStore<KiroCredentials>> {
         &self.auth_manager
+    }
+
+    /// Owned, `'static` handle to the same auth manager `auth_manager()`
+    /// borrows. Task 15's retry loop needs to call the manager's
+    /// *synchronous* `get_auth`/`force_refresh` from async code, which means
+    /// handing them to `tokio::task::spawn_blocking` — that requires an
+    /// owned `'static` value, which a plain `&KiroAuthManager` can't
+    /// provide. Cloning the `Arc` shares the exact same cache/singleflight
+    /// state (see the `auth_manager` field's doc comment), so this is not a
+    /// second manager instance.
+    pub fn auth_manager_handle(&self) -> Arc<KiroAuthManager<FileAuthStore<KiroCredentials>>> {
+        Arc::clone(&self.auth_manager)
     }
 
     /// Single-attempt POST to `AmazonCodeWhispererStreamingService.GenerateAssistantResponse`.
