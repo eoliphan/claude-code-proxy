@@ -660,35 +660,119 @@ mod tests {
 
     #[test]
     fn truncate_history_never_drops_below_two_entries() {
+        // Three plain user entries, no tool-use/tool-result structure at
+        // all, and a limit far below anything achievable. Without the
+        // `sanitized.len() > 2` floor guard the shrink loop has nothing
+        // stopping it from continuing (each `sanitize_history` re-pass on a
+        // plain-user-only list is a no-op, so it keeps shrinking) until the
+        // history is emptied -- so this genuinely exercises the guard, not
+        // just "a 2-entry input passes through unchanged" (that shape never
+        // enters the loop body at all, since `len() > 2` is false from the
+        // first check).
         let history = vec![
-            user_entry(&"x".repeat(1_000_000)),
-            assistant_entry(&"y".repeat(1_000_000)),
+            user_entry(&"a".repeat(1_000)),
+            user_entry(&"b".repeat(1_000)),
+            user_entry(&"c".repeat(1_000)),
         ];
         let result = truncate_history(history, 10);
-        assert_eq!(result.len(), 2);
+        assert_eq!(
+            result.len(),
+            2,
+            "floor guard should stop the loop at exactly 2 entries even though \
+             the size budget (10 bytes) is nowhere near satisfied"
+        );
     }
 
     #[test]
-    fn truncate_history_repairs_orphaned_tool_results_left_behind_by_truncation() {
-        // Oldest entries get dropped by truncation, potentially orphaning a
-        // tool result whose matching tool-use entry got dropped along with
-        // them; truncate_history must run inject_synthetic_tool_calls at the
-        // end to repair this.
+    fn truncate_history_repairs_id_mismatched_tool_result_surviving_truncation() {
+        // sanitize_history's keep/drop checks are presence-only (does *a*
+        // tool-use/tool-result entry exist next to this one), never
+        // ID-matching -- so an assistant tool-use entry (id "t1") directly
+        // followed by a user tool-results entry referencing a DIFFERENT id
+        // ("t2") satisfies both the lookahead and the lookback and survives
+        // sanitize_history intact. This is the only way truncate_history's
+        // final inject_synthetic_tool_calls repair pass actually has
+        // something to fix: positional removal alone can never orphan a
+        // tool result, because the shrink loop's front-alignment (drop
+        // non-userInputMessage entries at the new front) plus
+        // sanitize_history's leading-strip (drop a *leading* entry that
+        // itself carries tool_results) together always keep the surviving
+        // history "structurally" clean by presence -- only an ID mismatch
+        // that was already latent in the untruncated input can leave a
+        // dangling reference for inject_synthetic_tool_calls to catch.
+        const PAD_MARKER: &str = "PADMARK";
+        let padding = |n: usize| PAD_MARKER.repeat(n);
+
         let history = vec![
-            user_entry(&"pad".repeat(5_000)),
-            assistant_entry_with_tool_use("t1", "Search"),
+            user_entry(&padding(500)),                     // 0: dropped by truncation
+            assistant_entry(&padding(500)),                // 1: dropped (cascades with 0)
+            user_entry(&padding(500)),                     // 2: dropped by truncation
+            assistant_entry(&padding(500)),                // 3: dropped (cascades with 2)
+            user_entry("do X"),                            // 4: survives
+            assistant_entry_with_tool_use("t1", "Search"), // 5: survives
             user_entry_with_tool_results(
                 "Tool results provided.",
-                vec![tool_result("t1", &"pad".repeat(5_000))],
-            ),
-            user_entry("small"),
-            assistant_entry("small reply"),
+                vec![tool_result("t2", "r")], // MISMATCH: references "t2", not "t1"
+            ), // 6: survives
+            assistant_entry("final"),                      // 7: survives
+            user_entry("thanks"),                          // 8: survives
         ];
 
-        let result = truncate_history(history, 50);
-        // Whatever survives, every tool_results entry must have either a
-        // matching tool_use entry immediately before it, or a synthetic one
-        // injected by inject_synthetic_tool_calls.
+        // Budget sized to exactly what the surviving tail (entries 4..9)
+        // serializes to, plus slack -- forcing the loop to strip all four
+        // padding entries (each far larger than the tail) and then stop
+        // right at the tail, without eating into it.
+        let tail_only_size = serde_json::to_string(&history[4..]).unwrap().len();
+        let limit = tail_only_size + 100;
+        let full_size = serde_json::to_string(&history).unwrap().len();
+        assert!(
+            full_size > limit,
+            "fixture must start over budget to exercise shrinking"
+        );
+
+        let result = truncate_history(history, limit);
+
+        // Padding is gone.
+        assert!(
+            !result.iter().any(|e| e
+                .user_input_message
+                .as_ref()
+                .is_some_and(|u| u.content.contains(PAD_MARKER))),
+            "padding entries should have been truncated away"
+        );
+        // The original tool-use entry (id "t1") survived.
+        assert!(
+            result.iter().any(|e| e
+                .assistant_response_message
+                .as_ref()
+                .and_then(|a| a.tool_uses.as_ref())
+                .is_some_and(|tus| tus.iter().any(|tu| tu.tool_use_id == "t1"))),
+            "the original tool-use entry (t1) must survive truncation"
+        );
+        // A synthetic repair entry for the orphaned "t2" reference was
+        // inserted by inject_synthetic_tool_calls.
+        let synthetic = result.iter().find(|e| {
+            e.assistant_response_message
+                .as_ref()
+                .is_some_and(|a| a.content == "Tool calls were made.")
+        });
+        let synthetic = synthetic.expect(
+            "truncate_history must repair the orphaned tool_use_id \"t2\" reference \
+             via inject_synthetic_tool_calls",
+        );
+        let tool_uses = synthetic
+            .assistant_response_message
+            .as_ref()
+            .unwrap()
+            .tool_uses
+            .as_ref()
+            .unwrap();
+        assert_eq!(tool_uses.len(), 1);
+        assert_eq!(tool_uses[0].tool_use_id, "t2");
+        assert_eq!(tool_uses[0].name, "unknown_tool");
+
+        // Every surviving tool_results entry now has a matching tool_use
+        // (real or synthetic) somewhere before it in the final output.
         let mut valid_ids: HashSet<String> = HashSet::new();
         for entry in &result {
             if let Some(tool_uses) = entry
@@ -715,6 +799,35 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn truncate_history_can_return_fewer_than_two_entries_when_budget_is_severe() {
+        // Characterization test (TS-faithful, not a bug): a matched
+        // tool-use/tool-result pair with a severe enough limit can be
+        // reduced all the way to empty. The shrink loop's front-alignment
+        // drops the leading user entry, cascades into dropping the
+        // now-front assistant tool-use entry (not a userInputMessage), then
+        // re-sanitizes -- landing on a tool-results entry as the new front,
+        // which sanitize_history's OWN leading-strip check then removes too
+        // (a leading entry carrying tool_results is invalid), leaving
+        // nothing. The `sanitized.len() > 2` floor guard only stops the
+        // *outer* shrink loop from iterating again; it does not put a floor
+        // under what a single iteration's cascade + re-sanitize can remove.
+        // Task 14 (or any other consumer of `truncate_history`'s output)
+        // must not assume the result is ever non-empty.
+        let history = vec![
+            user_entry("do X"),
+            assistant_entry_with_tool_use("t1", "Search"),
+            user_entry_with_tool_results("Tool results provided.", vec![tool_result("t1", "r")]),
+        ];
+        let result = truncate_history(history, 1);
+        assert!(
+            result.is_empty(),
+            "expected truncate_history to reduce this fixture to empty under a \
+             severe budget, got {} entries",
+            result.len()
+        );
     }
 
     // ---- extract_tool_names_from_history / add_placeholder_tools ----
