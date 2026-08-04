@@ -153,7 +153,7 @@ pub const TOOL_RESULT_LIMIT: usize = 250_000;
 
 const TOOL_RESULTS_PROVIDED: &str = "Tool results provided.";
 const TRUNCATION_SEPARATOR: &str = "\n... [TRUNCATED] ...\n";
-const KIRO_ORIGIN: &str = "KIRO_CLI";
+pub(crate) const KIRO_ORIGIN: &str = "KIRO_CLI";
 
 /// The TS original strips unpaired UTF-16 surrogate halves
 /// (`/[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/g`).
@@ -324,7 +324,7 @@ pub fn convert_tools_to_kiro(tools: &[Value]) -> Vec<KiroToolSpec> {
 /// answering with). Used only for the boundary scan in [`build_history`];
 /// the main history-building loop no longer classifies a `"user"` message
 /// as one type or the other (see [`user_message_contribution`]).
-fn message_has_tool_result(msg: &Message) -> bool {
+pub(crate) fn message_has_tool_result(msg: &Message) -> bool {
     if msg.role != "user" {
         return false;
     }
@@ -334,7 +334,7 @@ fn message_has_tool_result(msg: &Message) -> bool {
 }
 
 /// Whether an `"assistant"` message contains at least one `tool_use` block.
-fn assistant_has_tool_use(msg: &Message) -> bool {
+pub(crate) fn assistant_has_tool_use(msg: &Message) -> bool {
     if msg.role != "assistant" {
         return false;
     }
@@ -382,19 +382,24 @@ fn build_tool_result(
 /// order (see the module doc comment); this walks every block exactly once,
 /// regardless of order, so real user text and every tool result are always
 /// both preserved rather than one silently overwriting or hiding the other.
-struct UserMessageContribution {
+pub(crate) struct UserMessageContribution {
     /// Real user-authored text (joined `Text`/`Thinking` blocks, `""`-joined
     /// like the rest of this port's text extraction), *before* any
     /// sentinel/system-prompt combination.
-    text: String,
+    pub(crate) text: String,
     /// Every image found, whether an outer block alongside the text/tool
     /// results, or nested inside a `ToolResult`'s own output content.
-    images: Vec<ImageSource>,
+    pub(crate) images: Vec<ImageSource>,
     /// Every `ToolResult` block found, converted to Kiro's shape.
-    tool_results: Vec<KiroToolResult>,
+    pub(crate) tool_results: Vec<KiroToolResult>,
 }
 
-fn user_message_contribution(content: &Value) -> UserMessageContribution {
+/// Also reused by Task 14's current-message assembly (`request.rs`) for
+/// tool-result-shaped messages in `req.messages[current_msg_start_idx..]` —
+/// it already walks every block regardless of order, which is exactly what's
+/// needed there to avoid the same order-dependent-extraction bug class this
+/// function itself exists to fix (see the module doc comment).
+pub(crate) fn user_message_contribution(content: &Value) -> UserMessageContribution {
     if let Value::String(s) = content {
         return UserMessageContribution {
             text: s.clone(),
@@ -515,6 +520,41 @@ fn fold_user_contribution(
     });
 }
 
+/// Walk an `"assistant"` message's content blocks into `(content,
+/// tool_uses)`. Extracted so [`build_history`]'s inline handling and Task
+/// 14's current-message assembly (`request.rs`, for the "resumed
+/// assistant+tool_use turn" branch — the boundary can land on an assistant
+/// message carrying pending `tool_use` blocks, see [`assistant_has_tool_use`])
+/// share one implementation. Preserves the thinking-prepend
+/// accumulation-order quirk verbatim: a `Thinking` block always ends up
+/// structurally *before* whatever text has already accumulated, regardless
+/// of the blocks' original source order (pinned by
+/// `thinking_block_is_prepended_not_appended_before_text` and
+/// `thinking_block_prepends_even_when_it_appears_after_text_in_source_order`
+/// below) — do not "simplify" this to a plain join.
+pub(crate) fn assistant_message_contribution(content: &Value) -> (String, Vec<KiroToolUse>) {
+    let blocks = normalize_content(content, Value::Null);
+    let mut arm_content = String::new();
+    let mut arm_tool_uses: Vec<KiroToolUse> = Vec::new();
+    for block in blocks {
+        match block {
+            ContentBlock::Text { text } => arm_content.push_str(&text),
+            ContentBlock::Thinking { thinking, .. } => {
+                arm_content = format!("<thinking>{thinking}</thinking>\n\n{arm_content}");
+            }
+            ContentBlock::ToolUse { id, name, input } => {
+                arm_tool_uses.push(KiroToolUse {
+                    name,
+                    tool_use_id: id,
+                    input,
+                });
+            }
+            _ => {}
+        }
+    }
+    (arm_content, arm_tool_uses)
+}
+
 #[derive(Debug)]
 pub struct BuildHistoryResult {
     pub history: Vec<KiroHistoryEntry>,
@@ -580,25 +620,7 @@ pub fn build_history(
             );
             i += 1;
         } else if msg.role == "assistant" {
-            let blocks = normalize_content(&msg.content, Value::Null);
-            let mut arm_content = String::new();
-            let mut arm_tool_uses: Vec<KiroToolUse> = Vec::new();
-            for block in blocks {
-                match block {
-                    ContentBlock::Text { text } => arm_content.push_str(&text),
-                    ContentBlock::Thinking { thinking, .. } => {
-                        arm_content = format!("<thinking>{thinking}</thinking>\n\n{arm_content}");
-                    }
-                    ContentBlock::ToolUse { id, name, input } => {
-                        arm_tool_uses.push(KiroToolUse {
-                            name,
-                            tool_use_id: id,
-                            input,
-                        });
-                    }
-                    _ => {}
-                }
-            }
+            let (arm_content, arm_tool_uses) = assistant_message_contribution(&msg.content);
             if !arm_content.is_empty() || !arm_tool_uses.is_empty() {
                 history.push(KiroHistoryEntry {
                     user_input_message: None,
