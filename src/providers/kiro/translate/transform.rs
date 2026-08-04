@@ -14,16 +14,26 @@
 //!   `tool_result` block (parsed here as [`ContentBlock::ToolResult`], via
 //!   [`normalize_content`]) with the tool's own output nested inside that
 //!   block's `content` field. Every place the TS checks
-//!   `msg.role === "toolResult"`, this port instead checks
-//!   `role == "user"` AND the first normalized content block is a
-//!   `ContentBlock::ToolResult` (see [`is_tool_result_message`]) — matching
-//!   how Claude Code always emits tool results as their own dedicated user
-//!   turn, never mixed with plain user text in the same message.
-//! - Unlike `pi`'s single-tool-result-per-message model, Anthropic's actual
-//!   wire format allows *multiple* `tool_result` blocks in one message
-//!   (parallel tool calls answered together). Where the TS walks a run of
-//!   consecutive `toolResult`-role *messages*, this port additionally walks
-//!   all `ToolResult` *blocks* within each tool-result-shaped message.
+//!   `msg.role === "toolResult"`, this port instead checks whether the
+//!   message's normalized content contains a `ContentBlock::ToolResult`
+//!   (see [`message_has_tool_result`]).
+//! - Unlike `pi`'s single-tool-result-per-message model — where a message is
+//!   *either* plain user text *or* exactly one tool result, never both —
+//!   Anthropic's real wire format allows a single `"user"` message to mix
+//!   text, image, and one or more `tool_result` blocks in any order (e.g. a
+//!   short comment alongside the tool output it's answering with, or several
+//!   `tool_result` blocks for parallel tool calls answered together in one
+//!   turn). An earlier version of this port classified a whole message as
+//!   one type or the other based on `blocks.first()` alone, silently
+//!   dropping whichever kind of content didn't match — a user comment
+//!   preceding a tool result vanished, and a tool result following user text
+//!   left a dangling `tool_use` with no matching `toolResults` entry. `user`
+//!   messages are now processed by walking every block once regardless of
+//!   order or position (see [`user_message_contribution`]), folding
+//!   `Text`/`Thinking` text and every `ToolResult` block (there can be more
+//!   than one, e.g. several parallel tool calls answered in the same turn)
+//!   into the same Kiro history entry, so nothing found in a `user`
+//!   message's content array is ever discarded.
 //! - This proxy's [`ImageSource`] can be URL-sourced (Anthropic
 //!   `source: {type: "url", ...}`), a case `pi`'s simpler
 //!   `{mimeType, data}` image model never has to handle. Kiro's own image
@@ -228,19 +238,17 @@ pub fn get_content_text(role: &str, content: &Value) -> String {
     join_blocks_text(blocks)
 }
 
-/// Port of `extractImages`. Returns `[]` for plain-string content and for
-/// this proxy's note-1 tool-result-shaped `"user"` messages (matching the
-/// TS's `role === "toolResult"` early return); otherwise returns every
-/// `ContentBlock::Image` found.
-pub fn extract_images(role: &str, content: &Value) -> Vec<ImageSource> {
-    if let Value::String(_) = content {
-        return Vec::new();
-    }
-    let blocks = normalize_content(content, Value::Null);
-    if role == "user" && matches!(blocks.first(), Some(ContentBlock::ToolResult { .. })) {
-        return Vec::new();
-    }
-    blocks
+/// Port of `extractImages`. Returns every `ContentBlock::Image` found in
+/// `content`, regardless of what other block types (including
+/// `ContentBlock::ToolResult`) are present alongside them — a message can
+/// legitimately carry both, and an earlier version of this function
+/// incorrectly returned `[]` for any message classified as tool-result-shaped
+/// even when it also carried its own outer image block. `role` is accepted
+/// for interface-signature parity with [`get_content_text`] but no longer
+/// changes behavior: a plain-string `content` naturally normalizes to no
+/// image blocks, so no separate early return is needed for it either.
+pub fn extract_images(_role: &str, content: &Value) -> Vec<ImageSource> {
+    normalize_content(content, Value::Null)
         .into_iter()
         .filter_map(|b| match b {
             ContentBlock::Image { source } => Some(source),
@@ -249,7 +257,10 @@ pub fn extract_images(role: &str, content: &Value) -> Vec<ImageSource> {
         .collect()
 }
 
-/// Port of `convertImagesToKiro`.
+/// Port of `convertImagesToKiro`. TS: `img.mimeType.split("/")[1] || "png"`
+/// — JS's `||` falls back on an *empty* string too (e.g. a degenerate
+/// `"image/"` media type), not just a missing segment, so this filters out
+/// an empty split result rather than only using `unwrap_or`.
 pub fn convert_images_to_kiro(images: &[ImageSource]) -> Vec<KiroImage> {
     images
         .iter()
@@ -258,6 +269,7 @@ pub fn convert_images_to_kiro(images: &[ImageSource]) -> Vec<KiroImage> {
                 .media_type
                 .split('/')
                 .nth(1)
+                .filter(|s| !s.is_empty())
                 .unwrap_or("png")
                 .to_string();
             let bytes = if img.source_type == "url" {
@@ -306,17 +318,19 @@ pub fn convert_tools_to_kiro(tools: &[Value]) -> Vec<KiroToolSpec> {
 }
 
 /// This proxy's note-1 translation of `msg.role === "toolResult"`: a
-/// `"user"` message whose first normalized content block is a
-/// `ContentBlock::ToolResult`. Anthropic's format never mixes plain user
-/// text with tool results in one message the way Claude Code emits them,
-/// so checking only the first block is sufficient and matches the design
-/// notes' defensive guidance.
-fn is_tool_result_message(msg: &Message) -> bool {
+/// `"user"` message carrying at least one `ContentBlock::ToolResult`
+/// anywhere in its content (not just as the first block — a real Claude
+/// Code turn can lead with a short text comment before the tool result it's
+/// answering with). Used only for the boundary scan in [`build_history`];
+/// the main history-building loop no longer classifies a `"user"` message
+/// as one type or the other (see [`user_message_contribution`]).
+fn message_has_tool_result(msg: &Message) -> bool {
     if msg.role != "user" {
         return false;
     }
-    let blocks = normalize_content(&msg.content, Value::Null);
-    matches!(blocks.first(), Some(ContentBlock::ToolResult { .. }))
+    normalize_content(&msg.content, Value::Null)
+        .iter()
+        .any(|b| matches!(b, ContentBlock::ToolResult { .. }))
 }
 
 /// Whether an `"assistant"` message contains at least one `tool_use` block.
@@ -362,6 +376,145 @@ fn build_tool_result(
     )
 }
 
+/// What a single `"user"`-role message contributes toward a Kiro
+/// `userInputMessage` history entry. Anthropic messages can freely mix
+/// `Text`/`Thinking`, `Image`, and one-or-more `ToolResult` blocks in any
+/// order (see the module doc comment); this walks every block exactly once,
+/// regardless of order, so real user text and every tool result are always
+/// both preserved rather than one silently overwriting or hiding the other.
+struct UserMessageContribution {
+    /// Real user-authored text (joined `Text`/`Thinking` blocks, `""`-joined
+    /// like the rest of this port's text extraction), *before* any
+    /// sentinel/system-prompt combination.
+    text: String,
+    /// Every image found, whether an outer block alongside the text/tool
+    /// results, or nested inside a `ToolResult`'s own output content.
+    images: Vec<ImageSource>,
+    /// Every `ToolResult` block found, converted to Kiro's shape.
+    tool_results: Vec<KiroToolResult>,
+}
+
+fn user_message_contribution(content: &Value) -> UserMessageContribution {
+    if let Value::String(s) = content {
+        return UserMessageContribution {
+            text: s.clone(),
+            images: Vec::new(),
+            tool_results: Vec::new(),
+        };
+    }
+    let mut text_parts: Vec<String> = Vec::new();
+    let mut images: Vec<ImageSource> = Vec::new();
+    let mut tool_results: Vec<KiroToolResult> = Vec::new();
+    for block in normalize_content(content, Value::Null) {
+        match block {
+            ContentBlock::Text { text } => text_parts.push(text),
+            ContentBlock::Thinking { thinking, .. } => text_parts.push(thinking),
+            ContentBlock::Image { source } => images.push(source),
+            ContentBlock::ToolResult {
+                tool_use_id,
+                content: nested,
+                is_error,
+            } => {
+                let (result, tr_images) = build_tool_result(&tool_use_id, &nested, is_error);
+                tool_results.push(result);
+                images.extend(tr_images);
+            }
+            ContentBlock::ToolUse { .. } => {} // not expected in a "user" message; ignore defensively
+        }
+    }
+    UserMessageContribution {
+        text: text_parts.concat(),
+        images,
+        tool_results,
+    }
+}
+
+/// Fold one message's [`UserMessageContribution`] into `history`: merge into
+/// `history`'s last entry if it's already a `userInputMessage` (matching the
+/// TS's `history[history.length-1]?.userInputMessage` check, which applies
+/// regardless of *why* that entry is a userInputMessage — real text, a prior
+/// tool-results fold, or both), otherwise push a fresh entry. `text` has
+/// already had any system-prompt prefix applied by the caller and is
+/// sanitized here, at the same call site the TS sanitizes user content.
+fn fold_user_contribution(
+    history: &mut Vec<KiroHistoryEntry>,
+    model_id: &str,
+    text: String,
+    images: Vec<ImageSource>,
+    tool_results: Vec<KiroToolResult>,
+) {
+    let text = sanitize_surrogates(&text);
+    let has_tool_results = !tool_results.is_empty();
+    let merges_into_prev = history
+        .last()
+        .is_some_and(|e| e.user_input_message.is_some());
+
+    if merges_into_prev {
+        let prev = history
+            .last_mut()
+            .and_then(|e| e.user_input_message.as_mut())
+            .expect("checked above");
+        if !text.is_empty() {
+            prev.content = format!("{}\n\n{}", prev.content, text);
+        }
+        if has_tool_results {
+            // Only announce "Tool results provided." once per entry -- a
+            // run of several consecutive tool-result messages must fold
+            // into a single sentinel, not repeat it per message.
+            let already_announced = prev
+                .user_input_message_context
+                .as_ref()
+                .and_then(|c| c.tool_results.as_ref())
+                .is_some_and(|v| !v.is_empty());
+            if !already_announced {
+                prev.content = format!("{}\n\n{TOOL_RESULTS_PROVIDED}", prev.content);
+            }
+            let ctx = prev
+                .user_input_message_context
+                .get_or_insert_with(KiroUserInputMessageContext::default);
+            ctx.tool_results
+                .get_or_insert_with(Vec::new)
+                .extend(tool_results);
+        }
+        if !images.is_empty() {
+            let kiro_images = convert_images_to_kiro(&images);
+            prev.images.get_or_insert_with(Vec::new).extend(kiro_images);
+        }
+        return;
+    }
+
+    let content = if has_tool_results {
+        if text.is_empty() {
+            TOOL_RESULTS_PROVIDED.to_string()
+        } else {
+            format!("{text}\n\n{TOOL_RESULTS_PROVIDED}")
+        }
+    } else {
+        text
+    };
+    history.push(KiroHistoryEntry {
+        user_input_message: Some(KiroUserInputMessage {
+            content,
+            model_id: model_id.to_string(),
+            origin: KIRO_ORIGIN.to_string(),
+            images: if images.is_empty() {
+                None
+            } else {
+                Some(convert_images_to_kiro(&images))
+            },
+            user_input_message_context: if has_tool_results {
+                Some(KiroUserInputMessageContext {
+                    tool_results: Some(tool_results),
+                    tools: None,
+                })
+            } else {
+                None
+            },
+        }),
+        assistant_response_message: None,
+    });
+}
+
 #[derive(Debug)]
 pub struct BuildHistoryResult {
     pub history: Vec<KiroHistoryEntry>,
@@ -393,7 +546,7 @@ pub fn build_history(
     }
 
     let mut current_msg_start_idx = messages.len() - 1;
-    while current_msg_start_idx > 0 && is_tool_result_message(&messages[current_msg_start_idx]) {
+    while current_msg_start_idx > 0 && message_has_tool_result(&messages[current_msg_start_idx]) {
         current_msg_start_idx -= 1;
     }
     if messages[current_msg_start_idx].role == "assistant"
@@ -409,46 +562,22 @@ pub fn build_history(
 
     while i < boundary {
         let msg = &messages[i];
-        if msg.role == "user" && !is_tool_result_message(msg) {
-            let mut content = get_content_text("user", &msg.content);
+        if msg.role == "user" {
+            let contribution = user_message_contribution(&msg.content);
+            let mut text = contribution.text;
             if let Some(sp) = system_prompt
                 && !system_prepended
             {
-                content = format!("{sp}\n\n{content}");
+                text = format!("{sp}\n\n{text}");
                 system_prepended = true;
             }
-            let images = extract_images("user", &msg.content);
-            let sanitized_content = sanitize_surrogates(&content);
-
-            let merges_into_prev = history
-                .last()
-                .is_some_and(|e| e.user_input_message.is_some());
-            if merges_into_prev {
-                let prev = history
-                    .last_mut()
-                    .and_then(|e| e.user_input_message.as_mut())
-                    .expect("checked above");
-                prev.content = format!("{}\n\n{}", prev.content, sanitized_content);
-                if !images.is_empty() {
-                    let kiro_images = convert_images_to_kiro(&images);
-                    prev.images.get_or_insert_with(Vec::new).extend(kiro_images);
-                }
-            } else {
-                history.push(KiroHistoryEntry {
-                    user_input_message: Some(KiroUserInputMessage {
-                        content: sanitized_content,
-                        model_id: model_id.to_string(),
-                        origin: KIRO_ORIGIN.to_string(),
-                        images: if images.is_empty() {
-                            None
-                        } else {
-                            Some(convert_images_to_kiro(&images))
-                        },
-                        user_input_message_context: None,
-                    }),
-                    assistant_response_message: None,
-                });
-            }
+            fold_user_contribution(
+                &mut history,
+                model_id,
+                text,
+                contribution.images,
+                contribution.tool_results,
+            );
             i += 1;
         } else if msg.role == "assistant" {
             let blocks = normalize_content(&msg.content, Value::Null);
@@ -484,66 +613,6 @@ pub fn build_history(
                 });
             }
             i += 1;
-        } else if is_tool_result_message(msg) {
-            let mut tool_results: Vec<KiroToolResult> = Vec::new();
-            let mut tr_images: Vec<ImageSource> = Vec::new();
-            let mut j = i;
-            while j < boundary && is_tool_result_message(&messages[j]) {
-                let blocks = normalize_content(&messages[j].content, Value::Null);
-                for block in blocks {
-                    if let ContentBlock::ToolResult {
-                        tool_use_id,
-                        content: nested,
-                        is_error,
-                    } = block
-                    {
-                        let (result, images) = build_tool_result(&tool_use_id, &nested, is_error);
-                        tool_results.push(result);
-                        tr_images.extend(images);
-                    }
-                }
-                j += 1;
-            }
-            i = j;
-
-            let merges_into_prev = history
-                .last()
-                .is_some_and(|e| e.user_input_message.is_some());
-            if merges_into_prev {
-                let prev = history
-                    .last_mut()
-                    .and_then(|e| e.user_input_message.as_mut())
-                    .expect("checked above");
-                prev.content = format!("{}\n\n{TOOL_RESULTS_PROVIDED}", prev.content);
-                if !tr_images.is_empty() {
-                    let kiro_images = convert_images_to_kiro(&tr_images);
-                    prev.images.get_or_insert_with(Vec::new).extend(kiro_images);
-                }
-                let ctx = prev
-                    .user_input_message_context
-                    .get_or_insert_with(KiroUserInputMessageContext::default);
-                ctx.tool_results
-                    .get_or_insert_with(Vec::new)
-                    .extend(tool_results);
-            } else {
-                history.push(KiroHistoryEntry {
-                    user_input_message: Some(KiroUserInputMessage {
-                        content: TOOL_RESULTS_PROVIDED.to_string(),
-                        model_id: model_id.to_string(),
-                        origin: KIRO_ORIGIN.to_string(),
-                        images: if tr_images.is_empty() {
-                            None
-                        } else {
-                            Some(convert_images_to_kiro(&tr_images))
-                        },
-                        user_input_message_context: Some(KiroUserInputMessageContext {
-                            tool_results: Some(tool_results),
-                            tools: None,
-                        }),
-                    }),
-                    assistant_response_message: None,
-                });
-            }
         } else {
             i += 1;
         }
@@ -588,6 +657,13 @@ mod tests {
 
     fn thinking_block(thinking: &str) -> Value {
         json!({"type": "thinking", "thinking": thinking})
+    }
+
+    fn image_block(data: &str) -> Value {
+        json!({
+            "type": "image",
+            "source": {"type": "base64", "media_type": "image/png", "data": data},
+        })
     }
 
     // ---- small helpers ----
@@ -681,6 +757,20 @@ mod tests {
     fn extract_images_returns_empty_for_tool_result_shaped_user_message() {
         let content = json!([tool_result_block("t1", Value::String("r".to_string()))]);
         assert!(extract_images("user", &content).is_empty());
+    }
+
+    #[test]
+    fn extract_images_returns_outer_images_even_when_a_tool_result_block_is_also_present() {
+        // Regression: an earlier version returned [] for ANY message
+        // classified as tool-result-shaped, silently dropping an outer
+        // image block that happened to sit alongside a tool_result block.
+        let content = json!([
+            tool_result_block("t1", Value::String("r".to_string())),
+            image_block("QUJD"),
+        ]);
+        let images = extract_images("user", &content);
+        assert_eq!(images.len(), 1);
+        assert_eq!(images[0].data, "QUJD");
     }
 
     // ---- build_history ----
@@ -1112,5 +1202,157 @@ mod tests {
         );
         // userInputMessage must be entirely absent, not null, per skip_serializing_if.
         assert!(value.get("userInputMessage").is_none());
+    }
+
+    // ---- mixed-order Text/ToolResult blocks in one message (reviewer-found bug) ----
+
+    #[test]
+    fn text_then_tool_result_in_one_message_preserves_both() {
+        // Critical regression: a message whose content is [Text, ToolResult]
+        // (a short comment followed by the tool result it's answering with)
+        // was previously misclassified as "plain user text" because only
+        // blocks.first() was inspected -- the ToolResult block was silently
+        // dropped, leaving the preceding assistant's tool_use with no
+        // matching toolResults entry anywhere in history.
+        let messages = vec![
+            user(Value::String("read it".to_string())),
+            assistant(json!([tool_use_block("t1", "Read", json!({}))])),
+            user(json!([
+                text_block("hurry"),
+                tool_result_block("t1", Value::String("...file contents...".to_string())),
+            ])),
+            assistant(Value::String("done".to_string())),
+            user(Value::String("thanks".to_string())),
+        ];
+        let result = build_history(&messages, "model-x", None);
+        assert_eq!(result.history.len(), 4);
+
+        let assistant_tool_use = result.history[1]
+            .assistant_response_message
+            .as_ref()
+            .unwrap();
+        assert_eq!(assistant_tool_use.tool_uses.as_ref().unwrap().len(), 1);
+
+        let entry = result.history[2].user_input_message.as_ref().unwrap();
+        // Neither the user's comment nor the tool result may be dropped.
+        assert_eq!(entry.content, "hurry\n\nTool results provided.");
+        let results = entry
+            .user_input_message_context
+            .as_ref()
+            .unwrap()
+            .tool_results
+            .as_ref()
+            .unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].tool_use_id, "t1");
+        assert_eq!(results[0].content[0].text, "...file contents...");
+    }
+
+    #[test]
+    fn tool_result_then_text_in_one_message_preserves_both() {
+        // Mirror of the above with the blocks in the opposite order: the old
+        // code recognized this as tool-result-shaped (first block matched)
+        // but then only processed ToolResult blocks, silently dropping the
+        // trailing user text.
+        let messages = vec![
+            user(Value::String("read it".to_string())),
+            assistant(json!([tool_use_block("t1", "Read", json!({}))])),
+            user(json!([
+                tool_result_block("t1", Value::String("...file contents...".to_string())),
+                text_block("hurry"),
+            ])),
+            assistant(Value::String("done".to_string())),
+            user(Value::String("thanks".to_string())),
+        ];
+        let result = build_history(&messages, "model-x", None);
+        let entry = result.history[2].user_input_message.as_ref().unwrap();
+        assert_eq!(entry.content, "hurry\n\nTool results provided.");
+        let results = entry
+            .user_input_message_context
+            .as_ref()
+            .unwrap()
+            .tool_results
+            .as_ref()
+            .unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].content[0].text, "...file contents...");
+    }
+
+    #[test]
+    fn multiple_tool_result_blocks_in_one_message_both_land_in_one_entry() {
+        // The real Anthropic shape for parallel tool calls answered in a
+        // single turn: ONE message, TWO tool_result blocks -- not two
+        // separate messages. Exercises the inner per-block loop that has no
+        // direct TS counterpart (pi is always one-tool-result-per-message).
+        let messages = vec![
+            user(Value::String("do X".to_string())),
+            assistant(json!([
+                tool_use_block("t1", "Search", json!({})),
+                tool_use_block("t2", "Fetch", json!({})),
+            ])),
+            user(json!([
+                tool_result_block("t1", Value::String("r1".to_string())),
+                tool_result_block("t2", Value::String("r2".to_string())),
+            ])),
+            assistant(Value::String("final".to_string())),
+            user(Value::String("thanks".to_string())),
+        ];
+        let result = build_history(&messages, "model-x", None);
+        assert_eq!(result.history.len(), 4);
+        let entry = result.history[2].user_input_message.as_ref().unwrap();
+        assert_eq!(entry.content, "Tool results provided.");
+        let results = entry
+            .user_input_message_context
+            .as_ref()
+            .unwrap()
+            .tool_results
+            .as_ref()
+            .unwrap();
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].tool_use_id, "t1");
+        assert_eq!(results[1].tool_use_id, "t2");
+    }
+
+    #[test]
+    fn boundary_scan_recognizes_a_mixed_trailing_tool_result_message() {
+        // The boundary scan must recognize a [Text, ToolResult] trailing
+        // message as tool-result-bearing (not just a first-block check),
+        // so an unanswered trailing tool call plus its (mixed) answer are
+        // excluded from history together, same as the pure case.
+        let messages = vec![
+            user(Value::String("do X".to_string())),
+            assistant(json!([tool_use_block("t1", "Search", json!({}))])),
+            user(json!([
+                text_block("here"),
+                tool_result_block("t1", Value::String("r1".to_string())),
+            ])),
+        ];
+        let result = build_history(&messages, "model-x", None);
+        assert_eq!(result.current_msg_start_idx, 1);
+        assert_eq!(result.history.len(), 1);
+    }
+
+    #[test]
+    fn outer_and_tool_result_images_both_surface_on_the_history_entry() {
+        let messages = vec![
+            user(Value::String("do X".to_string())),
+            assistant(json!([tool_use_block("t1", "Search", json!({}))])),
+            user(json!([
+                image_block("OUTER"),
+                tool_result_block(
+                    "t1",
+                    json!([{"type": "text", "text": "r1"}, image_block("NESTED")]),
+                ),
+            ])),
+            assistant(Value::String("final".to_string())),
+            user(Value::String("thanks".to_string())),
+        ];
+        let result = build_history(&messages, "model-x", None);
+        let entry = result.history[2].user_input_message.as_ref().unwrap();
+        let images = entry.images.as_ref().unwrap();
+        let bytes: Vec<&str> = images.iter().map(|i| i.source.bytes.as_str()).collect();
+        assert_eq!(bytes.len(), 2);
+        assert!(bytes.contains(&"OUTER"));
+        assert!(bytes.contains(&"NESTED"));
     }
 }
