@@ -168,8 +168,15 @@ pub fn save_kiro_cli_credentials_for(deps: &DirResolverEnv, creds: &KiroCredenti
     };
     // refresh is always the raw token (no pipe-packing — see Adversarial Review Findings #1)
     let raw_refresh_token = creds.refresh.as_str();
+    // Reconstructs the raw, un-buffered AWS expiry kiro-cli itself expects
+    // in its DB by adding back *this credential's own* recorded
+    // `expiry_buffer_ms` — not a hardcoded constant. `creds.expires` is
+    // this proxy's internal, already-buffered value (buffer amount varies
+    // by source; see `expiry_buffer_ms`'s doc comment), so assuming a
+    // single universal buffer here would reintroduce the same false
+    // invariant already eliminated from `KiroAuthManager`'s Layer 5.
     let expires_at = match time::OffsetDateTime::from_unix_timestamp(
-        (creds.expires as i64 + 5 * 60 * 1000) / 1000,
+        (creds.expires as i64 + creds.expiry_buffer_ms as i64) / 1000,
     ) {
         Ok(dt) => dt
             .format(&time::format_description::well_known::Rfc3339)
@@ -378,6 +385,63 @@ mod tests {
 
         // codewhisperer:odic:token row was never inserted, so it must still be absent
         assert!(query_value(&db_path, "codewhisperer:odic:token").is_none());
+    }
+
+    #[test]
+    fn save_reconstructs_expires_at_from_the_credentials_own_buffer_not_a_hardcoded_constant() {
+        // Regression test: save_kiro_cli_credentials_for used to assume
+        // every credential's `expires` was buffered by a hardcoded 5
+        // minutes when reconstructing the raw `expires_at` written back to
+        // kiro-cli's DB. It must instead use *this credential's own*
+        // expiry_buffer_ms, so a kiro-cli-sourced credential (buffer 0,
+        // round-tripped unchanged) and an IDE-sourced one (buffer 2 min)
+        // each get back their own true, un-buffered AWS expiry.
+        let tmp = TempDir::new().unwrap();
+        let db_path = make_kiro_cli_db(tmp.path());
+        let deps = crate::paths::DirResolverEnv {
+            platform: "linux".to_string(),
+            env: Default::default(),
+            home: tmp.path().to_string_lossy().to_string(),
+        };
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute(
+            "INSERT INTO auth_kv (key, value) VALUES (?1, ?2)",
+            rusqlite::params![
+                "kirocli:odic:token",
+                r#"{"access_token":"old","refresh_token":"old-r","expires_at":"2000-01-01T00:00:00.000Z"}"#
+            ],
+        )
+        .unwrap();
+
+        let base_expires: u64 = 4_102_444_800_000; // an arbitrary fixed instant
+        let creds = KiroCredentials {
+            access: "new-access".into(),
+            refresh: "new-refresh".into(),
+            expires: base_expires,
+            region: "eu-west-1".into(),
+            auth_method: KiroAuthMethod::Idc,
+            client_id: "cid".into(),
+            client_secret: "csec".into(),
+            profile_arn: None,
+            expiry_buffer_ms: 2 * 60 * 1000, // e.g. a Kiro IDE-sourced credential
+        };
+        save_kiro_cli_credentials_for(&deps, &creds);
+
+        let raw = query_value(&db_path, "kirocli:odic:token").unwrap();
+        let value: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        let written_expires_at = value["expires_at"].as_str().unwrap();
+        let written_ms = time::OffsetDateTime::parse(
+            written_expires_at,
+            &time::format_description::well_known::Rfc3339,
+        )
+        .unwrap()
+        .unix_timestamp()
+            * 1000;
+
+        // Must reconstruct using THIS credential's 2-minute buffer, not a
+        // hardcoded 5-minute one -- the old code would have written back
+        // base_expires + 5min here instead.
+        assert_eq!(written_ms as u64, base_expires + 2 * 60 * 1000);
     }
 
     #[test]

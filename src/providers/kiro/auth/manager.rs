@@ -27,6 +27,18 @@ fn now_ms() -> u64 {
         .as_millis() as u64
 }
 
+/// True when `access` is exactly the token a caller told us was just
+/// rejected (401/403). `rejected_access` is `None` for `get_auth`'s
+/// ordinary near-expiry-triggered refreshes (nothing was rejected, so
+/// nothing is excluded) and `Some(rejected_access)` for `force_refresh`'s
+/// 401/403 path. Establishes the same "pass the rejected token explicitly,
+/// gate candidates against it" convention already used by
+/// `codex/auth/manager.rs::CodexAuthManager::force_refresh` in this same
+/// codebase.
+fn is_rejected_token(access: &str, rejected_access: Option<&str>) -> bool {
+    rejected_access.is_some_and(|rejected| access == rejected)
+}
+
 /// Which login method `bootstrap_login` should prefer when there is no
 /// stored credential yet. `Auto` reuses any currently-valid Kiro IDE token
 /// first, regardless of its auth method; `BuilderId`/`Idc` skip that reuse
@@ -129,10 +141,18 @@ impl<S: AuthStorage<KiroCredentials>> KiroAuthManager<S> {
         if !stored.is_expired(now_ms() + REFRESH_MARGIN_MS) {
             return Ok(stored);
         }
-        self.refresh_singleflight(&stored)
+        self.refresh_singleflight(&stored, None)
     }
 
-    pub fn force_refresh(&self) -> Result<KiroCredentials, anyhow::Error> {
+    /// `rejected_access` is the access token that just got a 401/403 from
+    /// the backend — required, not optional, because a caller retrying
+    /// after an auth failure always has one. It's threaded all the way
+    /// through `refresh_cascade` so Layers 0, 1, and 5 (the ones that can
+    /// hand back an *existing* credential without ever contacting the
+    /// network) refuse to re-adopt that exact token — see
+    /// `refresh_cascade`'s doc comment for why a value comparison, not just
+    /// singleflight, is necessary here.
+    pub fn force_refresh(&self, rejected_access: &str) -> Result<KiroCredentials, anyhow::Error> {
         // Note: read the cache into an owned value in its own statement
         // (dropping the `cached` MutexGuard immediately) before ever
         // touching the store — deliberately *not* the equivalent-looking
@@ -150,7 +170,7 @@ impl<S: AuthStorage<KiroCredentials>> KiroAuthManager<S> {
                 anyhow::anyhow!("Not authenticated. Run: claude-code-proxy kiro auth login")
             })?,
         };
-        self.refresh_singleflight(&current)
+        self.refresh_singleflight(&current, Some(rejected_access))
     }
 
     /// Serializes the whole refresh critical section behind `refresh_lock`,
@@ -159,7 +179,7 @@ impl<S: AuthStorage<KiroCredentials>> KiroAuthManager<S> {
     /// counter, not a value comparison, decides that (see
     /// `refresh_generation`'s doc comment for why).
     ///
-    /// Two earlier approaches were tried and rejected here, both worth
+    /// Three earlier approaches were tried and rejected here, all worth
     /// recording so they aren't reintroduced:
     ///
     /// 1. Re-checking only `!latest.is_expired(...)`: `force_refresh` exists
@@ -179,46 +199,81 @@ impl<S: AuthStorage<KiroCredentials>> KiroAuthManager<S> {
     ///    cascade again — including a second real (and likely also-failing)
     ///    Layer 2 refresh attempt and, worse, `refresh_via_kiro_cli_for`'s
     ///    15-second subprocess (Layer 3.5) — serialized one loser at a time
-    ///    behind the very lock meant to prevent exactly that. And Layers 0
-    ///    (Kiro IDE), 1 (kiro-cli precheck), and the solo-caller case for
-    ///    force_refresh from Layer 0 all bypass this discriminator entirely
-    ///    regardless of which comparison strategy is used — a rejected
-    ///    token that the IDE genuinely hasn't rotated yet will always come
-    ///    back from Layer 0 unchanged; no pre-check inside
-    ///    `refresh_singleflight` can fix that; only re-running the full
-    ///    cascade (which a *solo* force_refresh call still always does,
-    ///    since its own generation sample can't have changed) gives that
-    ///    external source a chance to have moved on.
+    ///    behind the very lock meant to prevent exactly that.
+    /// 3. A bare generation counter (no `rejected_access` at all) fixed (2)
+    ///    but reopened a variant of (1): Layers 0 (Kiro IDE), 1 (kiro-cli
+    ///    precheck), and 5 (graceful degradation) can all hand back an
+    ///    *existing* credential without ever contacting the network, so a
+    ///    rejected token that the IDE genuinely hasn't rotated yet would
+    ///    keep coming back from Layer 0 unchanged, forever, across any
+    ///    number of solo `force_refresh` retries — no lock/generation
+    ///    bookkeeping inside `refresh_singleflight` alone can fix that,
+    ///    because the bug isn't a synchronization bug; the cascade itself
+    ///    needs to know which token is disqualified.
     ///
-    /// The generation counter fixes both: it only reports "someone else
-    /// already handled this" when an `adopt()` call has actually completed
-    /// since this caller started waiting, independent of what value that
-    /// adoption produced.
+    /// The fix is two parts working together, mirroring the pattern already
+    /// established by `codex/auth/manager.rs`'s
+    /// `CodexAuthManager::force_refresh(&self, rejected_access: &str)`:
+    /// `rejected_access` is threaded explicitly from `force_refresh` all the
+    /// way through `refresh_cascade`, and Layers 0, 1, and 5 (see
+    /// `refresh_cascade`) refuse to adopt/extend a candidate whose `access`
+    /// equals it. The generation counter still does its job for everything
+    /// else (avoiding redundant work when a *different*, non-rejected
+    /// credential was concurrently adopted), but it is deliberately not
+    /// trusted blindly here either: the fast-path re-check below also
+    /// verifies the store's value isn't the rejected token before trusting
+    /// it, because the generation bump it observes could belong to an
+    /// unrelated concurrent caller (e.g. a plain `get_auth()` that knows
+    /// nothing about this rejection) that itself re-adopted the very token
+    /// this caller is trying to get rid of.
     fn refresh_singleflight(
         &self,
         hint: &KiroCredentials,
+        rejected_access: Option<&str>,
     ) -> Result<KiroCredentials, anyhow::Error> {
         let generation_before = self.refresh_generation.load(Ordering::SeqCst);
         let _guard = self.refresh_lock.lock().unwrap();
         if self.refresh_generation.load(Ordering::SeqCst) != generation_before
             && let Ok(Some(latest)) = self.store.load()
+            && !is_rejected_token(&latest.access, rejected_access)
         {
             *self.cached.lock().unwrap() = Some(latest.clone());
             return Ok(latest);
         }
-        self.refresh_cascade(hint)
+        self.refresh_cascade(hint, rejected_access)
     }
 
-    fn refresh_cascade(&self, current: &KiroCredentials) -> Result<KiroCredentials, anyhow::Error> {
+    /// `rejected_access` (see `force_refresh`'s doc comment) disqualifies a
+    /// candidate credential whose `access` matches it from Layers 0, 1, and
+    /// 5 — the three layers that can return an *existing* credential
+    /// without ever contacting the network, and so are the only ones that
+    /// could otherwise hand a caller back the exact token it just told us
+    /// was rejected. Layer 2's real refresh isn't gated: it always talks to
+    /// the server and gets back a genuinely new token (or fails), so it
+    /// cannot reproduce the rejected one. Layers 3/3.5/4 aren't gated
+    /// either — they exist specifically to catch kiro-cli having rotated to
+    /// something *different* concurrently, which `expired_cli.refresh !=
+    /// current.refresh` (Layer 4) and the general "kiro-cli moved on" intent
+    /// of 3/3.5 already select for.
+    fn refresh_cascade(
+        &self,
+        current: &KiroCredentials,
+        rejected_access: Option<&str>,
+    ) -> Result<KiroCredentials, anyhow::Error> {
         // Layer 0: Kiro IDE token is the freshest source (IDE keeps it
-        // continuously refreshed) — always prefer it if valid.
-        if let Some(ide) = super::kiro_ide::read_ide_credentials_for(&self.deps, false) {
+        // continuously refreshed) — always prefer it if valid, unless it's
+        // the exact token that was just rejected (the IDE hasn't rotated
+        // yet; reusing it would just repeat the same 401/403).
+        if let Some(ide) = super::kiro_ide::read_ide_credentials_for(&self.deps, false)
+            && !is_rejected_token(&ide.access, rejected_access)
+        {
             return self.adopt(ide);
         }
         // Layer 1: any currently-valid kiro-cli token (social preferred if
-        // present, else IDC).
+        // present, else IDC), same rejected-token exclusion as Layer 0.
         let precheck = super::kiro_cli::get_kiro_cli_social_token_for(&self.deps)
-            .or_else(|| super::kiro_cli::get_kiro_cli_credentials_for(&self.deps, false));
+            .or_else(|| super::kiro_cli::get_kiro_cli_credentials_for(&self.deps, false))
+            .filter(|creds| !is_rejected_token(&creds.access, rejected_access));
         if let Some(creds) = precheck {
             return self.adopt(creds);
         }
@@ -265,12 +320,18 @@ impl<S: AuthStorage<KiroCredentials>> KiroAuthManager<S> {
                 // persist an already-expired-per-AWS token as "good" for up
                 // to 5 minutes past its true expiry. Buy time rather than
                 // failing outright, but only as much time as this specific
-                // source's own margin actually earned. (No extra store
-                // re-read needed here: refresh_singleflight already
-                // re-checked the store once under refresh_lock before
-                // entering this cascade at all.)
-                let actual_expiry = current.expires + current.expiry_buffer_ms;
-                if !current.access.is_empty() && now_ms() < actual_expiry {
+                // source's own margin actually earned, and never for the
+                // token that was just rejected -- extending its expiry
+                // would falsely mark it "good for longer" when we have
+                // direct evidence it isn't. (No extra store re-read needed
+                // here: refresh_singleflight already re-checked the store
+                // once under refresh_lock before entering this cascade at
+                // all.)
+                let actual_expiry = current.expires.saturating_add(current.expiry_buffer_ms);
+                if !current.access.is_empty()
+                    && !is_rejected_token(&current.access, rejected_access)
+                    && now_ms() < actual_expiry
+                {
                     let mut extended = current.clone();
                     extended.expires = actual_expiry;
                     return self.adopt(extended);
@@ -521,9 +582,79 @@ mod tests {
         let manager = KiroAuthManager::with_deps(store, deps);
 
         let hint = far_future_creds();
-        let result = manager.refresh_cascade(&hint).unwrap();
+        let result = manager.refresh_cascade(&hint, None).unwrap();
 
         assert_eq!(result.access, "ide-access");
+    }
+
+    #[test]
+    fn refresh_cascade_skips_layer_0_when_the_ide_token_is_the_rejected_one() {
+        // Finding #1(b): a 401 arrives on token T, sourced from the Kiro
+        // IDE. If the IDE hasn't rotated its own token yet (a real race --
+        // it refreshes on its own schedule, not ours), Layer 0 must not
+        // hand back that exact same rejected token; it must fall through
+        // to the next layer instead, here Layer 1's valid kiro-cli
+        // credential.
+        let tmp = TempDir::new().unwrap();
+        write_ide_token_file(tmp.path(), "rejected-token", "2099-01-01T00:00:00.000Z");
+        write_kiro_cli_idc_db(tmp.path(), "cli-access", "2099-01-01T00:00:00.000Z");
+        let deps = deps_for(tmp.path());
+        let store = InMemoryAuthStore::<KiroCredentials>::default();
+        let manager = KiroAuthManager::with_deps(store, deps);
+
+        let hint = far_future_creds();
+        let result = manager
+            .refresh_cascade(&hint, Some("rejected-token"))
+            .unwrap();
+
+        assert_eq!(
+            result.access, "cli-access",
+            "Layer 0's rejected IDE token must be skipped in favor of Layer 1's kiro-cli credential"
+        );
+    }
+
+    #[test]
+    fn refresh_cascade_skips_layer_1_when_kiro_cli_holds_the_rejected_token() {
+        // Same Finding #1(b) concern as Layer 0, but for kiro-cli's
+        // precheck: if kiro-cli's cached token is the one that was just
+        // rejected (kiro-cli hasn't refreshed either), Layer 1 must not
+        // hand it back -- it must fall through, here reaching Layer 2's
+        // real refresh since nothing else is available.
+        let tmp = TempDir::new().unwrap();
+        write_kiro_cli_idc_db(tmp.path(), "rejected-token", "2099-01-01T00:00:00.000Z");
+        let deps = deps_for(tmp.path());
+
+        let call_count = Arc::new(AtomicUsize::new(0));
+        let counter = call_count.clone();
+        let refresh_fn: Box<RefreshFn> = Box::new(move |current: &KiroCredentials| {
+            counter.fetch_add(1, Ordering::SeqCst);
+            Ok(KiroCredentials {
+                access: "freshly-refreshed-access".into(),
+                refresh: "new-r".into(),
+                expires: now_ms() + 3_600_000,
+                region: current.region.clone(),
+                auth_method: current.auth_method,
+                client_id: current.client_id.clone(),
+                client_secret: current.client_secret.clone(),
+                profile_arn: current.profile_arn.clone(),
+                expiry_buffer_ms: 0,
+            })
+        });
+
+        let store = InMemoryAuthStore::<KiroCredentials>::default();
+        let manager = KiroAuthManager::with_deps_and_refresh_fn(store, deps, refresh_fn);
+
+        let hint = far_future_creds();
+        let result = manager
+            .refresh_cascade(&hint, Some("rejected-token"))
+            .unwrap();
+
+        assert_eq!(result.access, "freshly-refreshed-access");
+        assert_eq!(
+            call_count.load(Ordering::SeqCst),
+            1,
+            "Layer 1's rejected kiro-cli token must be skipped, falling through to a real Layer 2 refresh"
+        );
     }
 
     #[test]
@@ -608,7 +739,7 @@ mod tests {
             expiry_buffer_ms: buffer_ms,
         };
 
-        let result = manager.refresh_cascade(&current).unwrap();
+        let result = manager.refresh_cascade(&current, None).unwrap();
 
         assert_eq!(result.access, "buffered-access");
         assert_eq!(
@@ -645,11 +776,49 @@ mod tests {
             expiry_buffer_ms: 0,
         };
 
-        let err = manager.refresh_cascade(&current).unwrap_err();
+        let err = manager.refresh_cascade(&current, None).unwrap_err();
 
         assert!(
             err.to_string().contains("simulated failure"),
             "must propagate the real refresh error instead of falsely granting extra time"
+        );
+    }
+
+    #[test]
+    fn refresh_cascade_layer_5_refuses_to_extend_the_rejected_token() {
+        // Finding #1(b), Layer 5's half: graceful degradation must never
+        // hand back the exact token that was just proven bad by a
+        // 401/403 -- doing so would falsely mark it "good for longer" and
+        // guarantee the caller repeats the same failure. Same shape as
+        // `refresh_cascade_layer_5_extends_expiry_by_the_credentials_own_buffer`
+        // (which would otherwise succeed via Layer 5), but this time the
+        // token IS the one that was just rejected.
+        let refresh_fn: Box<RefreshFn> =
+            Box::new(|_current: &KiroCredentials| Err(anyhow::anyhow!("simulated failure")));
+        let tmp = TempDir::new().unwrap();
+        let deps = deps_for(tmp.path());
+        let store = InMemoryAuthStore::<KiroCredentials>::default();
+        let manager = KiroAuthManager::with_deps_and_refresh_fn(store, deps, refresh_fn);
+
+        let current = KiroCredentials {
+            access: "rejected-token".into(),
+            refresh: "r".into(),
+            expires: now_ms().saturating_sub(60_000),
+            region: "us-east-1".into(),
+            auth_method: KiroAuthMethod::Idc,
+            client_id: String::new(),
+            client_secret: String::new(),
+            profile_arn: None,
+            expiry_buffer_ms: 5 * 60 * 1000,
+        };
+
+        let err = manager
+            .refresh_cascade(&current, Some("rejected-token"))
+            .unwrap_err();
+
+        assert!(
+            err.to_string().contains("simulated failure"),
+            "must propagate the real refresh error instead of extending the rejected token's expiry"
         );
     }
 
@@ -676,7 +845,7 @@ mod tests {
         let store = InMemoryAuthStore::<KiroCredentials>::default();
         let manager = KiroAuthManager::with_deps_and_refresh_fn(store, deps, refresh_fn);
 
-        let result = manager.refresh_cascade(&far_future_creds()).unwrap();
+        let result = manager.refresh_cascade(&far_future_creds(), None).unwrap();
 
         assert_eq!(result.access, "kiro-cli-rotated-access");
     }
@@ -733,7 +902,7 @@ mod tests {
             expiry_buffer_ms: 0,
         };
 
-        let result = manager.refresh_cascade(&current).unwrap();
+        let result = manager.refresh_cascade(&current, None).unwrap();
 
         assert_eq!(result.access, "layer-4-recovered-access");
         assert_eq!(
@@ -756,6 +925,16 @@ mod tests {
         // loser through the entire cascade (including a second failing
         // refresh_fn call) again. The generation-counter re-check must
         // short-circuit the loser regardless of access-token identity.
+        //
+        // Both callers pass a `rejected_access` that deliberately does NOT
+        // match "still-the-same-access" -- Layer 5 now also refuses to
+        // extend a candidate that matches `rejected_access` (rejected
+        // approach 3, see refresh_singleflight's doc comment), so this test
+        // uses an unrelated placeholder to isolate what it's actually
+        // testing here (the generation-counter singleflight mechanism) from
+        // that separate rejected-token-gating mechanism, which has its own
+        // dedicated coverage (`refresh_cascade_layer_5_refuses_to_extend_the_rejected_token`
+        // and friends).
         let store = InMemoryAuthStore::<KiroCredentials>::default();
         let near_expiry = KiroCredentials {
             access: "still-the-same-access".into(),
@@ -794,7 +973,7 @@ mod tests {
                 let b = start.clone();
                 std::thread::spawn(move || {
                     b.wait();
-                    m.force_refresh()
+                    m.force_refresh("an-unrelated-401-token-not-in-play")
                 })
             })
             .collect();
@@ -852,7 +1031,7 @@ mod tests {
         let deps = deps_for(tmp.path());
         let manager = KiroAuthManager::with_deps_and_refresh_fn(store, deps, refresh_fn);
 
-        let result = manager.force_refresh().unwrap();
+        let result = manager.force_refresh("a").unwrap();
 
         assert_eq!(
             call_count.load(Ordering::SeqCst),
@@ -920,7 +1099,7 @@ mod tests {
                 let b = start.clone();
                 std::thread::spawn(move || {
                     b.wait();
-                    m.force_refresh()
+                    m.force_refresh("old-access")
                 })
             })
             .collect();
@@ -944,6 +1123,99 @@ mod tests {
             stored.access, "new-access",
             "store's final content must be the single refresh, not an earlier/stale write"
         );
+    }
+
+    #[test]
+    fn force_refresh_does_not_trust_a_fast_path_replay_of_the_rejected_token() {
+        // A subtler corner of Finding #1(b): even the generation-counter
+        // fast path in refresh_singleflight (added to fix the *unrelated*
+        // singleflight regression) must not blindly trust "some adopt()
+        // completed" -- if that completed adopt() belonged to an unrelated
+        // caller (e.g. a plain get_auth() that knows nothing about this
+        // 401) that itself re-adopted the exact token this caller is
+        // trying to get rid of, trusting the fast path would silently hand
+        // the caller back the very token it explicitly flagged as bad.
+        //
+        // Made fully deterministic (no thread-timing luck) by manually
+        // holding `refresh_lock` from this test thread: `refresh_lock` is
+        // a private field, and this test module has access to it as a
+        // sibling module. Thread A blocks trying to acquire it inside
+        // `refresh_singleflight`; while it's blocked, this thread performs
+        // the "concurrent unrelated adopt" directly via `refresh_cascade`
+        // (which itself never touches `refresh_lock` -- only
+        // `refresh_singleflight` enforces it), then releases the lock.
+        let tmp = TempDir::new().unwrap();
+        write_ide_token_file(tmp.path(), "rejected-token", "2099-01-01T00:00:00.000Z");
+        let deps = deps_for(tmp.path());
+
+        let call_count = Arc::new(AtomicUsize::new(0));
+        let counter = call_count.clone();
+        let refresh_fn: Box<RefreshFn> = Box::new(move |current: &KiroCredentials| {
+            counter.fetch_add(1, Ordering::SeqCst);
+            Ok(KiroCredentials {
+                access: "freshly-refreshed-access".into(),
+                refresh: "new-r".into(),
+                expires: now_ms() + 3_600_000,
+                region: current.region.clone(),
+                auth_method: current.auth_method,
+                client_id: current.client_id.clone(),
+                client_secret: current.client_secret.clone(),
+                profile_arn: current.profile_arn.clone(),
+                expiry_buffer_ms: 0,
+            })
+        });
+
+        let store = InMemoryAuthStore::<KiroCredentials>::default();
+        store
+            .save(KiroCredentials {
+                access: "rejected-token".into(),
+                refresh: "r".into(),
+                expires: now_ms() + 3_600_000,
+                region: "us-east-1".into(),
+                auth_method: KiroAuthMethod::Idc,
+                client_id: String::new(),
+                client_secret: String::new(),
+                profile_arn: None,
+                expiry_buffer_ms: 0,
+            })
+            .unwrap();
+
+        let manager = Arc::new(KiroAuthManager::with_deps_and_refresh_fn(
+            store, deps, refresh_fn,
+        ));
+
+        // Hold the lock manually so Thread A blocks inside
+        // refresh_singleflight after sampling generation_before.
+        let guard = manager.refresh_lock.lock().unwrap();
+
+        let m = manager.clone();
+        let handle = std::thread::spawn(move || m.force_refresh("rejected-token"));
+
+        // Generous margin for Thread A to reach and block on the lock --
+        // it only needs to sample one atomic and attempt one mutex lock
+        // first, so this is not a tight race.
+        std::thread::sleep(std::time::Duration::from_millis(50));
+
+        // The "concurrent unrelated adopt": bypasses the lock entirely
+        // (exactly as refresh_cascade allows), re-adopting the Kiro IDE's
+        // token -- which is still "rejected-token", since nothing here
+        // passes a rejected_access to gate it.
+        let hint = far_future_creds();
+        let replayed = manager.refresh_cascade(&hint, None).unwrap();
+        assert_eq!(
+            replayed.access, "rejected-token",
+            "sanity check: Layer 0 wins normally when nothing is rejected"
+        );
+
+        drop(guard);
+
+        let result = handle.join().unwrap().unwrap();
+
+        assert_ne!(
+            result.access, "rejected-token",
+            "the fast path must not trust a store value that matches rejected_access, even after a generation bump"
+        );
+        assert_eq!(result.access, "freshly-refreshed-access");
     }
 
     struct RecordingCallbacks {
