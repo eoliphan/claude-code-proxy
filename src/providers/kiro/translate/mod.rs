@@ -1,3 +1,4 @@
+pub mod history;
 pub mod model_allowlist;
 pub mod model_discovery;
 pub mod models;
