@@ -639,6 +639,37 @@ mod tests {
         );
     }
 
+    #[test]
+    fn declared_tools_reach_the_current_message_on_a_first_turn_with_no_history() {
+        // The single most common request shape: first turn, no history yet.
+        // add_placeholder_tools(declared, &[]) returns `declared` unchanged,
+        // but nothing else in this test suite asserts declared tools ever
+        // reach `user_input_message_context.tools` when history is empty --
+        // every other placeholder/context test uses a multi-message fixture
+        // with populated history.
+        let mut request = req(vec![user(Value::String("hi".to_string()))]);
+        request.extra.insert(
+            "tools".to_string(),
+            json!([{"name": "Search", "description": "search the web", "input_schema": {"type": "object", "properties": {}}}]),
+        );
+        let (kiro, _) = build_kiro_request(&request, base_opts("conv-4b")).unwrap();
+
+        assert!(
+            kiro.conversation_state.history.is_none(),
+            "sanity check: this fixture should have no history"
+        );
+        let ctx = kiro
+            .conversation_state
+            .current_message
+            .user_input_message
+            .user_input_message_context
+            .as_ref()
+            .expect("context should be present -- a tool was declared");
+        let tools = ctx.tools.as_ref().expect("tools should be Some");
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].tool_specification.name, "Search");
+    }
+
     // ---- conversation_id passthrough ----
 
     #[test]
