@@ -1,3 +1,4 @@
+pub mod event_parser;
 pub mod history;
 pub mod model_allowlist;
 pub mod model_discovery;
