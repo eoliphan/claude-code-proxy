@@ -14,6 +14,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use crate::auth::AuthStorage;
 use crate::paths::DirResolverEnv;
 
+use super::device::DeviceLoginCallbacks;
 use super::kiro_credentials::KiroCredentials;
 
 const REFRESH_MARGIN_MS: u64 = 5 * 60 * 1000;
@@ -220,6 +221,61 @@ impl<S: AuthStorage<KiroCredentials>> KiroAuthManager<S> {
                 Err(refresh_err)
             }
         }
+    }
+
+    /// `bootstrap_login` implements the TS `loginKiro`'s ordering for the
+    /// *initial* (no-stored-credentials) case, which differs from
+    /// `refresh_cascade` mainly in trying the device-code flow as the final
+    /// fallback instead of returning an error. Uses the same
+    /// `self.deps`-injected `_for` variants as `refresh_cascade` throughout.
+    pub fn bootstrap_login(
+        &self,
+        callbacks: &dyn DeviceLoginCallbacks,
+        preferred: KiroLoginMethod,
+        start_url: Option<&str>,
+    ) -> Result<KiroCredentials, anyhow::Error> {
+        // Step 1: try an existing valid Kiro IDE token, unless the caller
+        // explicitly requested Builder ID (which should not silently reuse
+        // an IDC-sourced IDE token) or requested Idc without a start_url.
+        let try_ide_first = matches!(preferred, KiroLoginMethod::Auto)
+            || (matches!(preferred, KiroLoginMethod::Idc) && start_url.is_some());
+        if try_ide_first
+            && let Some(ide) = super::kiro_ide::read_ide_credentials_for(&self.deps, false)
+        {
+            return self.adopt(ide);
+        }
+
+        // Step 2: any currently-valid kiro-cli token (social preferred if
+        // present, else IDC).
+        let cli = super::kiro_cli::get_kiro_cli_social_token_for(&self.deps)
+            .or_else(|| super::kiro_cli::get_kiro_cli_credentials_for(&self.deps, false));
+        if let Some(creds) = cli {
+            return self.adopt(creds);
+        }
+
+        // Step 3: silent refresh from expired IDE creds, then expired
+        // kiro-cli creds, writing the result back to kiro-cli's DB on
+        // success either way.
+        if let Some(expired_ide) = super::kiro_ide::read_ide_credentials_for(&self.deps, true)
+            && let Ok(refreshed) = (self.refresh_fn)(&expired_ide)
+        {
+            super::kiro_cli::save_kiro_cli_credentials_for(&self.deps, &refreshed);
+            return self.adopt(refreshed);
+        }
+        if let Some(expired_cli) = super::kiro_cli::get_kiro_cli_credentials_for(&self.deps, true)
+            && let Ok(refreshed) = (self.refresh_fn)(&expired_cli)
+        {
+            super::kiro_cli::save_kiro_cli_credentials_for(&self.deps, &refreshed);
+            return self.adopt(refreshed);
+        }
+
+        // Step 4: nothing to reuse — run the interactive device flow.
+        let creds = if let Some(url) = start_url {
+            super::device::run_device_login_idc(callbacks, url)?
+        } else {
+            super::device::run_device_login_builder_id(callbacks)?
+        };
+        self.adopt(creds)
     }
 
     fn adopt(&self, creds: KiroCredentials) -> Result<KiroCredentials, anyhow::Error> {
@@ -456,5 +512,53 @@ mod tests {
             stored.access, "new-access",
             "store's final content must be the single refresh, not an earlier/stale write"
         );
+    }
+
+    struct RecordingCallbacks {
+        progress_calls: AtomicUsize,
+        prompt_calls: AtomicUsize,
+    }
+
+    impl DeviceLoginCallbacks for RecordingCallbacks {
+        fn on_progress(&self, _message: &str) {
+            self.progress_calls.fetch_add(1, Ordering::SeqCst);
+        }
+        fn on_auth_prompt(&self, _verification_uri_complete: &str, _user_code: &str) {
+            self.prompt_calls.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    #[test]
+    fn bootstrap_login_prefers_kiro_cli_over_device_flow() {
+        // Per Adversarial Review Findings #17, kiro_cli.rs's functions all
+        // take the same `_for(deps)` injectable-path pattern kiro_ide.rs
+        // already used in Task 1 — so this test constructs a real
+        // temp-dir-backed kiro-cli DB fixture, builds a `DirResolverEnv`
+        // pointing at that temp dir, constructs the manager via
+        // `KiroAuthManager::with_deps`, and calls `bootstrap_login`. No
+        // network mock is needed: the cascade must never reach the device
+        // flow at all when kiro-cli has a valid credential, which the
+        // `RecordingCallbacks` zero-call assertions verify directly.
+        let tmp = TempDir::new().unwrap();
+        write_kiro_cli_idc_db(tmp.path(), "cli-access", "2099-01-01T00:00:00.000Z");
+        let deps = deps_for(tmp.path());
+        let store = InMemoryAuthStore::<KiroCredentials>::default();
+        let manager = KiroAuthManager::with_deps(store, deps);
+        let callbacks = RecordingCallbacks {
+            progress_calls: AtomicUsize::new(0),
+            prompt_calls: AtomicUsize::new(0),
+        };
+
+        let result = manager
+            .bootstrap_login(&callbacks, KiroLoginMethod::Auto, None)
+            .unwrap();
+
+        assert_eq!(result.access, "cli-access");
+        assert_eq!(
+            callbacks.progress_calls.load(Ordering::SeqCst),
+            0,
+            "device flow must never be attempted when kiro-cli already has a valid credential"
+        );
+        assert_eq!(callbacks.prompt_calls.load(Ordering::SeqCst), 0);
     }
 }
