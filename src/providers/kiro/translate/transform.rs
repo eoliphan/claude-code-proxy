@@ -974,4 +974,143 @@ mod tests {
         assert!(result.history.is_empty());
         assert!(!result.system_prepended);
     }
+
+    #[test]
+    fn system_prompt_is_not_consumed_when_history_is_empty() {
+        // Single message -> entirely "current", nothing lands in history, so
+        // there's no "first user message in history" to prepend onto. Task
+        // 14 relies on `system_prepended == false` here to know it must
+        // prepend the system prompt itself instead.
+        let messages = vec![user(Value::String("hi".to_string()))];
+        let result = build_history(&messages, "model-x", Some("SYS"));
+        assert_eq!(result.current_msg_start_idx, 0);
+        assert!(result.history.is_empty());
+        assert!(!result.system_prepended);
+    }
+
+    #[test]
+    fn tool_result_is_error_maps_to_error_status() {
+        let messages = vec![
+            user(Value::String("do X".to_string())),
+            assistant(json!([tool_use_block("t1", "Search", json!({}))])),
+            user(json!([
+                json!({"type": "tool_result", "tool_use_id": "t1", "content": "boom", "is_error": true})
+            ])),
+            assistant(Value::String("final".to_string())),
+            user(Value::String("thanks".to_string())),
+        ];
+        let result = build_history(&messages, "model-x", None);
+        let tool_result_entry = result.history[2].user_input_message.as_ref().unwrap();
+        let results = tool_result_entry
+            .user_input_message_context
+            .as_ref()
+            .unwrap()
+            .tool_results
+            .as_ref()
+            .unwrap();
+        assert_eq!(results[0].status, KiroToolResultStatus::Error);
+    }
+
+    #[test]
+    fn tool_result_text_is_truncated_to_tool_result_limit() {
+        let long_text = "x".repeat(TOOL_RESULT_LIMIT + 1000);
+        let messages = vec![
+            user(Value::String("do X".to_string())),
+            assistant(json!([tool_use_block("t1", "Search", json!({}))])),
+            user(json!([tool_result_block("t1", Value::String(long_text))])),
+            assistant(Value::String("final".to_string())),
+            user(Value::String("thanks".to_string())),
+        ];
+        let result = build_history(&messages, "model-x", None);
+        let tool_result_entry = result.history[2].user_input_message.as_ref().unwrap();
+        let text = &tool_result_entry
+            .user_input_message_context
+            .as_ref()
+            .unwrap()
+            .tool_results
+            .as_ref()
+            .unwrap()[0]
+            .content[0]
+            .text;
+        assert!(text.contains(TRUNCATION_SEPARATOR));
+        assert!(text.chars().count() < TOOL_RESULT_LIMIT + 1000);
+    }
+
+    #[test]
+    fn serializes_user_entry_with_images_and_tool_results_using_kiro_wire_field_names() {
+        let entry = KiroHistoryEntry {
+            user_input_message: Some(KiroUserInputMessage {
+                content: "Tool results provided.".to_string(),
+                model_id: "model-x".to_string(),
+                origin: "KIRO_CLI".to_string(),
+                images: Some(vec![KiroImage {
+                    format: "png".to_string(),
+                    source: KiroImageSource {
+                        bytes: "QUJD".to_string(),
+                    },
+                }]),
+                user_input_message_context: Some(KiroUserInputMessageContext {
+                    tool_results: Some(vec![KiroToolResult {
+                        content: vec![KiroToolResultText {
+                            text: "result text".to_string(),
+                        }],
+                        status: KiroToolResultStatus::Success,
+                        tool_use_id: "t1".to_string(),
+                    }]),
+                    tools: None,
+                }),
+            }),
+            assistant_response_message: None,
+        };
+        let value = serde_json::to_value(&entry).unwrap();
+        assert_eq!(
+            value,
+            json!({
+                "userInputMessage": {
+                    "content": "Tool results provided.",
+                    "modelId": "model-x",
+                    "origin": "KIRO_CLI",
+                    "images": [{"format": "png", "source": {"bytes": "QUJD"}}],
+                    "userInputMessageContext": {
+                        "toolResults": [{
+                            "content": [{"text": "result text"}],
+                            "status": "success",
+                            "toolUseId": "t1",
+                        }],
+                    },
+                },
+            })
+        );
+    }
+
+    #[test]
+    fn serializes_assistant_entry_with_tool_uses_and_omits_absent_fields() {
+        let entry = KiroHistoryEntry {
+            user_input_message: None,
+            assistant_response_message: Some(KiroAssistantResponseMessage {
+                content: "".to_string(),
+                tool_uses: Some(vec![KiroToolUse {
+                    name: "Search".to_string(),
+                    tool_use_id: "t1".to_string(),
+                    input: json!({"q": "rust"}),
+                }]),
+            }),
+        };
+        let value = serde_json::to_value(&entry).unwrap();
+        assert_eq!(
+            value,
+            json!({
+                "assistantResponseMessage": {
+                    "content": "",
+                    "toolUses": [{
+                        "name": "Search",
+                        "toolUseId": "t1",
+                        "input": {"q": "rust"},
+                    }],
+                },
+            })
+        );
+        // userInputMessage must be entirely absent, not null, per skip_serializing_if.
+        assert!(value.get("userInputMessage").is_none());
+    }
 }
