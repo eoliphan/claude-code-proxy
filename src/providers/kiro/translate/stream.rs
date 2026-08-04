@@ -2614,6 +2614,80 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn an_idle_timeout_after_content_terminates_instead_of_retrying() {
+        let server = spawn_kiro_mock(
+            vec![Script::chunks(vec![
+                (Duration::ZERO, r#"{"content":"partial"}"#),
+                (
+                    Duration::from_millis(400),
+                    r#"{"contextUsagePercentage":5}"#,
+                ),
+            ])],
+            None,
+        );
+        let (client, _tmp) = test_client("tok", "us-east-1", Some("arn:test"));
+        let req = sample_request();
+
+        let (result, sse) = run_case(RunCase {
+            server: &server,
+            client: &client,
+            req: &req,
+            reasoning: false,
+            timeouts: StreamTimeouts {
+                first_token_ms: 5_000,
+                idle_ms: 50,
+            },
+            policy: fast_policy(),
+        })
+        .await;
+
+        match result {
+            Err(KiroStreamError::Other(e)) => {
+                assert!(
+                    e.to_string().contains("idle timeout"),
+                    "expected an idle-timeout message, got {e}"
+                );
+            }
+            other => panic!("expected Other(idle timeout), got {other:?}"),
+        }
+        assert_eq!(
+            server.generate_count(),
+            1,
+            "content was already streamed, so the request must not be retried"
+        );
+        assert_eq!(text_deltas(&sse).concat(), "partial");
+        assert_eq!(frame_names(&sse).last().map(String::as_str), Some("error"));
+    }
+
+    #[tokio::test]
+    async fn a_dropped_receiver_ends_the_stream_without_an_error() {
+        let server = spawn_kiro_mock(
+            vec![Script::ok(
+                r#"{"content":"nobody is listening"}{"contextUsagePercentage":5}"#,
+            )],
+            None,
+        );
+        let (client, _tmp) = test_client("tok", "us-east-1", Some("arn:test"));
+        let req = sample_request();
+        let (tx, rx) = tokio::sync::mpsc::channel(4);
+        drop(rx);
+        let opts = RunStreamOptions {
+            client: &client,
+            model: sample_model(),
+            req: &req,
+            message_id: "msg_kiro_test",
+            conversation_id: "conv-fixed-for-the-whole-request",
+            reasoning_enabled: false,
+            timeouts: fast_timeouts(),
+        };
+
+        let result = run_kiro_stream_impl(opts, tx, Some(&server.url), fast_policy()).await;
+
+        result.expect("a disconnected client is not a stream failure");
+        assert_eq!(server.generate_count(), 1);
+    }
+
     #[test]
     fn exponential_backoff_doubles_and_saturates() {
         assert_eq!(exponential_backoff(0, 500, 10_000), 500);
