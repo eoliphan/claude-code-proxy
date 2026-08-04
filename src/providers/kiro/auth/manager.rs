@@ -433,6 +433,54 @@ mod tests {
     }
 
     #[test]
+    fn force_refresh_forces_a_real_refresh_even_when_the_stored_token_still_looks_locally_valid() {
+        // Regression test for the discriminator fix in `refresh_singleflight`
+        // (see its doc comment): force_refresh exists for the 401/403 path,
+        // where the caller passes in the token the server just rejected as
+        // `hint`. That token is often still "not expired" by our own
+        // 5-minute-margin heuristic -- if the store re-check only asked "is
+        // the stored token still fresh enough" (ignoring whether it's the
+        // *same* token), a solo caller would read back the exact same
+        // rejected token from the store and hand it straight back to the
+        // retrying caller, silently defeating "force". This test uses a
+        // credential that is deliberately NOT locally expired, so a version
+        // of the re-check without the access-token comparison would
+        // short-circuit here and never call refresh_fn at all.
+        let store = InMemoryAuthStore::<KiroCredentials>::default();
+        let valid = far_future_creds();
+        store.save(valid).unwrap();
+
+        let call_count = Arc::new(AtomicUsize::new(0));
+        let counter = call_count.clone();
+        let refresh_fn: Box<RefreshFn> = Box::new(move |current: &KiroCredentials| {
+            counter.fetch_add(1, Ordering::SeqCst);
+            Ok(KiroCredentials {
+                access: "forced-refresh-access".into(),
+                refresh: "forced-refresh-refresh".into(),
+                expires: now_ms() + 3_600_000,
+                region: current.region.clone(),
+                auth_method: current.auth_method,
+                client_id: current.client_id.clone(),
+                client_secret: current.client_secret.clone(),
+                profile_arn: current.profile_arn.clone(),
+            })
+        });
+
+        let tmp = TempDir::new().unwrap();
+        let deps = deps_for(tmp.path());
+        let manager = KiroAuthManager::with_deps_and_refresh_fn(store, deps, refresh_fn);
+
+        let result = manager.force_refresh().unwrap();
+
+        assert_eq!(
+            call_count.load(Ordering::SeqCst),
+            1,
+            "force_refresh must hit the network even though the stored token wasn't locally expired"
+        );
+        assert_eq!(result.access, "forced-refresh-access");
+    }
+
+    #[test]
     fn concurrent_force_refresh_only_hits_the_network_once() {
         // Regression test for Adversarial Review Findings #13. Two threads
         // call force_refresh() concurrently on the SAME manager instance
