@@ -2239,16 +2239,57 @@ mod tests {
     #[tokio::test]
     async fn auth_failures_stop_after_the_shared_retry_budget() {
         let server = spawn_kiro_mock(vec![Script::error(403, r#"{"error":"nope"}"#)], None);
-        let (client, _tmp) = test_client("tok", "us-east-1", Some("arn:test"));
+        let tmp = TempDir::new().unwrap();
+        let store = FileAuthStore::new(
+            tmp.path().join("auth.json").to_string_lossy().to_string(),
+            tmp.path().join("legacy.json").to_string_lossy().to_string(),
+        );
+        store
+            .save(far_future_creds(
+                "stale-access",
+                "us-east-1",
+                Some("arn:test"),
+            ))
+            .unwrap();
+        // The budget is deliberately 1, not the default 3: every refresh past
+        // the first has no fresh credential left to find (the IDE token below
+        // is already the one that was just rejected), so the auth cascade
+        // would fall through to its kiro-cli *shellout* layer — which resolves
+        // the binary from PATH rather than from the injected temp HOME, and
+        // would refresh the developer's real credentials from a unit test.
+        // One retry exercises the shared-budget cutoff without going there.
+        write_ide_token(tmp.path(), "fresh-access");
+        let client =
+            KiroHttpClient::for_test(KiroAuthManager::with_deps(store, deps_for(tmp.path())));
         let req = sample_request();
 
-        let (result, _sse) = run_simple(&server, &client, &req).await;
+        let (result, _sse) = run_case(RunCase {
+            server: &server,
+            client: &client,
+            req: &req,
+            reasoning: false,
+            timeouts: fast_timeouts(),
+            policy: RetryPolicy {
+                max_retries: 1,
+                ..fast_policy()
+            },
+        })
+        .await;
 
-        assert!(matches!(result, Err(KiroStreamError::Auth(_))));
+        assert!(
+            matches!(result, Err(KiroStreamError::Auth(_))),
+            "expected Auth, got {result:?}"
+        );
+        let requests = server.generate_requests();
         assert_eq!(
-            server.generate_count(),
-            4,
-            "the initial attempt plus max_retries=3 retries"
+            requests.len(),
+            2,
+            "the initial attempt plus max_retries=1 retry"
+        );
+        assert_eq!(
+            header_value(&requests[1], "authorization").as_deref(),
+            Some("Bearer fresh-access"),
+            "the one retry still used the refreshed credential"
         );
     }
 
@@ -2611,6 +2652,61 @@ mod tests {
             names.last().map(String::as_str),
             Some("error"),
             "a client already consuming the stream must see a clean termination: {names:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_mid_stream_error_event_before_any_content_is_retried() {
+        let server = spawn_kiro_mock(
+            vec![
+                Script::ok(r#"{"error":"InternalServerException","message":"boom"}"#),
+                Script::ok(r#"{"content":"second try"}{"contextUsagePercentage":5}"#),
+            ],
+            None,
+        );
+        let (client, _tmp) = test_client("tok", "us-east-1", Some("arn:test"));
+        let req = sample_request();
+
+        let (result, sse) = run_simple(&server, &client, &req).await;
+
+        result.expect("the retry should succeed");
+        assert_eq!(server.generate_count(), 2);
+        assert_eq!(text_deltas(&sse).concat(), "second try");
+        assert_eq!(
+            frame_names(&sse)
+                .iter()
+                .filter(|n| *n == "message_start")
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn a_persistent_stream_error_fails_after_the_shared_budget() {
+        let server = spawn_kiro_mock(
+            vec![Script::ok(
+                r#"{"error":"InternalServerException","message":"boom"}"#,
+            )],
+            None,
+        );
+        let (client, _tmp) = test_client("tok", "us-east-1", Some("arn:test"));
+        let req = sample_request();
+
+        let (result, sse) = run_simple(&server, &client, &req).await;
+
+        match result {
+            Err(KiroStreamError::Other(e)) => assert!(
+                e.to_string().contains(
+                    "Kiro API stream error after max retries: InternalServerException: boom"
+                ),
+                "unexpected message: {e}"
+            ),
+            other => panic!("expected Other(stream error), got {other:?}"),
+        }
+        assert_eq!(server.generate_count(), 4);
+        assert!(
+            sse.is_empty(),
+            "nothing was ever emitted, so there is no stream to terminate with an error frame"
         );
     }
 
