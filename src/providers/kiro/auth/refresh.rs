@@ -12,6 +12,28 @@ use super::kiro_credentials::{KiroAuthMethod, KiroCredentials};
 
 const OIDC_USER_AGENT: &str = "pi-cli";
 
+/// Buffer subtracted from the real AWS/Kiro-reported expiry when computing
+/// `KiroCredentials::expires` for tokens this module refreshes directly.
+/// Recorded on the returned credential's `expiry_buffer_ms` field so
+/// `KiroAuthManager`'s Layer 5 graceful-degradation fallback can reconstruct
+/// the true expiry without assuming every credential source used the same
+/// buffer (it doesn't -- see `expiry_buffer_ms`'s own doc comment).
+const EXPIRY_BUFFER_MS: u64 = 5 * 60 * 1000;
+
+/// A `reqwest::blocking::Client` with a bounded request timeout. Without
+/// this, a hung AWS/Kiro endpoint would hold `KiroAuthManager::refresh_lock`
+/// indefinitely (this module's callers always call it from inside that
+/// lock's critical section) -- once the cached credential expires, every
+/// subsequent Kiro request would queue behind it and the whole provider
+/// would stall process-wide. Falls back to an un-timed client only if the
+/// builder itself fails to construct (never observed in practice).
+fn blocking_client_with_timeout() -> reqwest::blocking::Client {
+    reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .unwrap_or_else(|_| reqwest::blocking::Client::new())
+}
+
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct DesktopRefreshRequest {
@@ -61,7 +83,7 @@ fn refresh_token_direct_for(
         KiroAuthMethod::Desktop => {
             let base = base_url_for_region(&credentials.region);
             let url = format!("{base}/refreshToken");
-            let client = reqwest::blocking::Client::new();
+            let client = blocking_client_with_timeout();
 
             let body = DesktopRefreshRequest {
                 refresh_token: credentials.refresh.clone(),
@@ -91,12 +113,13 @@ fn refresh_token_direct_for(
                 access: refresh_resp.access_token,
                 expires: now_ms()
                     .saturating_add(refresh_resp.expires_in.saturating_mul(1000))
-                    .saturating_sub(5 * 60 * 1000),
+                    .saturating_sub(EXPIRY_BUFFER_MS),
                 region: credentials.region.clone(),
                 auth_method: KiroAuthMethod::Desktop,
                 client_id: String::new(),
                 client_secret: String::new(),
                 profile_arn: credentials.profile_arn.clone(),
+                expiry_buffer_ms: EXPIRY_BUFFER_MS,
             })
         }
         KiroAuthMethod::Idc => {
@@ -106,7 +129,7 @@ fn refresh_token_direct_for(
 
             let base = base_url_for_region(&credentials.region);
             let url = format!("{base}/token");
-            let client = reqwest::blocking::Client::new();
+            let client = blocking_client_with_timeout();
 
             let body = IdcRefreshRequest {
                 client_id: credentials.client_id.clone(),
@@ -133,12 +156,13 @@ fn refresh_token_direct_for(
                 access: refresh_resp.access_token,
                 expires: now_ms()
                     .saturating_add(refresh_resp.expires_in.saturating_mul(1000))
-                    .saturating_sub(5 * 60 * 1000),
+                    .saturating_sub(EXPIRY_BUFFER_MS),
                 region: credentials.region.clone(),
                 auth_method: KiroAuthMethod::Idc,
                 client_id: credentials.client_id.clone(),
                 client_secret: credentials.client_secret.clone(),
                 profile_arn: credentials.profile_arn.clone(),
+                expiry_buffer_ms: EXPIRY_BUFFER_MS,
             })
         }
     }
@@ -185,6 +209,7 @@ mod tests {
             client_id: String::new(),
             client_secret: String::new(),
             profile_arn: None,
+            expiry_buffer_ms: 0,
         };
 
         let refreshed = refresh_token_direct_for(&creds, &|_region| server.url.clone())
@@ -199,6 +224,10 @@ mod tests {
         assert!(
             refreshed.expires > now_ms(),
             "expires should be in the future"
+        );
+        assert_eq!(
+            refreshed.expiry_buffer_ms, EXPIRY_BUFFER_MS,
+            "must record the buffer actually subtracted, so Layer 5 can reconstruct the true expiry"
         );
     }
 
@@ -226,6 +255,7 @@ mod tests {
             client_id: String::new(),
             client_secret: String::new(),
             profile_arn: None,
+            expiry_buffer_ms: 0,
         };
 
         let refreshed = refresh_token_direct_for(&creds, &|_region| server.url.clone())
@@ -269,6 +299,7 @@ mod tests {
             client_id: "test-client-id".to_string(),
             client_secret: "test-client-secret".to_string(),
             profile_arn: None,
+            expiry_buffer_ms: 0,
         };
 
         let refreshed = refresh_token_direct_for(&creds, &|_region| server.url.clone())
@@ -278,6 +309,7 @@ mod tests {
         assert_eq!(refreshed.refresh, "new-idc-refresh");
         assert_eq!(refreshed.client_id, "test-client-id");
         assert_eq!(refreshed.client_secret, "test-client-secret");
+        assert_eq!(refreshed.expiry_buffer_ms, EXPIRY_BUFFER_MS);
         assert_eq!(refreshed.auth_method, KiroAuthMethod::Idc);
 
         // Wire-format assertions: verify the request body contains the client credentials.
@@ -309,6 +341,7 @@ mod tests {
             client_id: String::new(), // Empty — this is the error condition
             client_secret: "test-secret".to_string(),
             profile_arn: None,
+            expiry_buffer_ms: 0,
         };
 
         let err = refresh_token_direct_for(&creds, &|_region| server.url.clone())
@@ -341,6 +374,7 @@ mod tests {
             client_id: String::new(),
             client_secret: String::new(),
             profile_arn: None,
+            expiry_buffer_ms: 0,
         };
 
         let err = refresh_token_direct_for(&creds, &|_region| server.url.clone())
@@ -372,6 +406,7 @@ mod tests {
             client_id: "test-client".to_string(),
             client_secret: "test-secret".to_string(),
             profile_arn: None,
+            expiry_buffer_ms: 0,
         };
 
         let err = refresh_token_direct_for(&creds, &|_region| server.url.clone())

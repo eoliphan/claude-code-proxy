@@ -199,6 +199,8 @@ fn poll_device_code(
                 client_id: client_id.to_string(),
                 client_secret: client_secret.to_string(),
                 profile_arn: None,
+                // Matches the 5-minute buffer subtracted just above.
+                expiry_buffer_ms: 5 * 60 * 1000,
             });
         }
 

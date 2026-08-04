@@ -437,6 +437,7 @@ mod tests {
             client_id: String::new(),
             client_secret: String::new(),
             profile_arn: profile_arn.map(str::to_string),
+            expiry_buffer_ms: 0,
         }
     }
 

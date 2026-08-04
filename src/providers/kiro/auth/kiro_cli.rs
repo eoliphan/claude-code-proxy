@@ -111,6 +111,10 @@ fn read_credentials_from_db(
         client_id,
         client_secret,
         profile_arn: token.profile_arn,
+        // kiro-cli stores (and this function reads) the raw, un-buffered
+        // `expires_at` -- no margin has been subtracted from it, unlike
+        // kiro_ide.rs's and refresh.rs's/device.rs's sources.
+        expiry_buffer_ms: 0,
     })
 }
 
@@ -363,6 +367,7 @@ mod tests {
             client_id: "cid".into(),
             client_secret: "csec".into(),
             profile_arn: None,
+            expiry_buffer_ms: 0,
         };
         save_kiro_cli_credentials_for(&deps, &creds);
 

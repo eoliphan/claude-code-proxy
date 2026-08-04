@@ -86,6 +86,7 @@ pub fn read_ide_credentials_for(
         client_id,
         client_secret,
         profile_arn: None,
+        expiry_buffer_ms: EXPIRY_BUFFER_MS as u64,
     })
 }
 
