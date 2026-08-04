@@ -2239,6 +2239,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_credential_profile_arn_beats_a_stale_endpoint_cache_entry() {
+        // The cache is keyed by endpoint, so a credential rotated to another
+        // account in the same region would keep sending the previous
+        // account's ARN if the cache were consulted first — burning an auth
+        // retry before the 401/403 handler invalidates it. Credential first,
+        // matching the reference's precedence.
+        let server = spawn_kiro_mock(
+            vec![Script::ok(
+                r#"{"content":"hi"}{"contextUsagePercentage":5}"#,
+            )],
+            Some(Script::ok(r#"{"profiles":[{"arn":"arn:from-api"}]}"#)),
+        );
+        PROFILE_CACHE.set(&server.endpoint(), "arn:stale".to_string());
+        let (client, _tmp) = test_client("tok", "us-east-1", Some("arn:from-credential"));
+        let req = sample_request();
+
+        let (result, _sse) = run_simple(&server, &client, &req).await;
+
+        result.expect("stream should succeed");
+        let body = request_body(&server.generate_requests()[0]);
+        assert_eq!(
+            body["profileArn"], "arn:from-credential",
+            "the credential's own ARN must win over the endpoint cache"
+        );
+        assert_eq!(
+            server.profile_request_count(),
+            0,
+            "a credential-supplied ARN needs no lookup"
+        );
+        PROFILE_CACHE.invalidate(&server.endpoint());
+    }
+
+    #[tokio::test]
     async fn resolved_profile_arn_is_cached_and_absent_profiles_are_omitted() {
         let server = spawn_kiro_mock(
             vec![Script::ok(
@@ -2346,6 +2379,12 @@ mod tests {
             tmp.path().join("auth.json").to_string_lossy().to_string(),
             tmp.path().join("legacy.json").to_string_lossy().to_string(),
         );
+        // `profile_arn: None` is load-bearing, not incidental: a
+        // credential-supplied ARN short-circuits profile resolution entirely
+        // (see `a_credential_profile_arn_beats_a_stale_endpoint_cache_entry`),
+        // which would make the arn:stale -> arn:fresh invalidation assertion
+        // below vacuous. The IDE token file written next is likewise
+        // profile-less, so both attempts go through the cache/lookup path.
         store
             .save(far_future_creds("stale-access", "us-east-1", None))
             .unwrap();
