@@ -26,21 +26,31 @@ struct KiroIdeClientFile {
     client_secret: Option<String>,
 }
 
-fn sso_cache_dir(deps: &DirResolverEnv) -> Option<PathBuf> {
-    Some(PathBuf::from(&deps.home).join(".aws").join("sso").join("cache"))
+fn sso_cache_dir(deps: &DirResolverEnv) -> PathBuf {
+    PathBuf::from(&deps.home)
+        .join(".aws")
+        .join("sso")
+        .join("cache")
 }
 
-pub fn read_ide_credentials_for(deps: &DirResolverEnv, allow_expired: bool) -> Option<KiroCredentials> {
-    let cache_dir = sso_cache_dir(deps)?;
+pub fn read_ide_credentials_for(
+    deps: &DirResolverEnv,
+    allow_expired: bool,
+) -> Option<KiroCredentials> {
+    let cache_dir = sso_cache_dir(deps);
     let token_path = cache_dir.join("kiro-auth-token.json");
     let raw = std::fs::read_to_string(&token_path).ok()?;
     let token: KiroIdeTokenFile = serde_json::from_str(&raw).ok()?;
     let access = token.access_token?;
     let refresh = token.refresh_token?;
     let expires_at_raw = token.expires_at?;
-    let expires_at_ms = time::OffsetDateTime::parse(&expires_at_raw, &time::format_description::well_known::Rfc3339)
-        .ok()?
-        .unix_timestamp() * 1000;
+    let expires_at_ms = time::OffsetDateTime::parse(
+        &expires_at_raw,
+        &time::format_description::well_known::Rfc3339,
+    )
+    .ok()?
+    .unix_timestamp()
+        * 1000;
     let expires = (expires_at_ms - EXPIRY_BUFFER_MS).max(0) as u64;
 
     if !allow_expired {
@@ -60,7 +70,10 @@ pub fn read_ide_credentials_for(deps: &DirResolverEnv, allow_expired: bool) -> O
             let reg_path = cache_dir.join(format!("{hash}.json"));
             let raw = std::fs::read_to_string(reg_path).ok()?;
             let reg: KiroIdeClientFile = serde_json::from_str(&raw).ok()?;
-            Some((reg.client_id.unwrap_or_default(), reg.client_secret.unwrap_or_default()))
+            Some((
+                reg.client_id.unwrap_or_default(),
+                reg.client_secret.unwrap_or_default(),
+            ))
         })
         .unwrap_or_default();
 
@@ -104,9 +117,12 @@ mod tests {
     fn reads_valid_token_file() {
         let tmp = TempDir::new().unwrap();
         let future_iso = "2099-01-01T00:00:00.000Z";
-        write_token_file(tmp.path(), &format!(
-            r#"{{"accessToken":"at","refreshToken":"rt","expiresAt":"{future_iso}","region":"eu-west-1"}}"#
-        ));
+        write_token_file(
+            tmp.path(),
+            &format!(
+                r#"{{"accessToken":"at","refreshToken":"rt","expiresAt":"{future_iso}","region":"eu-west-1"}}"#
+            ),
+        );
         let deps = crate::paths::DirResolverEnv {
             platform: "linux".to_string(),
             env: Default::default(),
@@ -132,7 +148,10 @@ mod tests {
     #[test]
     fn returns_none_when_expired_and_not_allowed() {
         let tmp = TempDir::new().unwrap();
-        write_token_file(tmp.path(), r#"{"accessToken":"at","refreshToken":"rt","expiresAt":"2000-01-01T00:00:00.000Z"}"#);
+        write_token_file(
+            tmp.path(),
+            r#"{"accessToken":"at","refreshToken":"rt","expiresAt":"2000-01-01T00:00:00.000Z"}"#,
+        );
         let deps = crate::paths::DirResolverEnv {
             platform: "linux".to_string(),
             env: Default::default(),
@@ -146,13 +165,21 @@ mod tests {
     fn reads_companion_client_registration_file() {
         let tmp = TempDir::new().unwrap();
         let future_iso = "2099-01-01T00:00:00.000Z";
-        write_token_file(tmp.path(), &format!(
-            r#"{{"accessToken":"at","refreshToken":"rt","expiresAt":"{future_iso}","clientIdHash":"abc123"}}"#
-        ));
+        write_token_file(
+            tmp.path(),
+            &format!(
+                r#"{{"accessToken":"at","refreshToken":"rt","expiresAt":"{future_iso}","clientIdHash":"abc123"}}"#
+            ),
+        );
         fs::write(
-            tmp.path().join(".aws").join("sso").join("cache").join("abc123.json"),
+            tmp.path()
+                .join(".aws")
+                .join("sso")
+                .join("cache")
+                .join("abc123.json"),
             r#"{"clientId":"cid","clientSecret":"csecret"}"#,
-        ).unwrap();
+        )
+        .unwrap();
         let deps = crate::paths::DirResolverEnv {
             platform: "linux".to_string(),
             env: Default::default(),
@@ -161,5 +188,72 @@ mod tests {
         let creds = read_ide_credentials_for(&deps, false).unwrap();
         assert_eq!(creds.client_id, "cid");
         assert_eq!(creds.client_secret, "csecret");
+    }
+
+    #[test]
+    fn tolerates_missing_client_registration_file() {
+        let tmp = TempDir::new().unwrap();
+        let future_iso = "2099-01-01T00:00:00.000Z";
+        write_token_file(
+            tmp.path(),
+            &format!(
+                r#"{{"accessToken":"at","refreshToken":"rt","expiresAt":"{future_iso}","clientIdHash":"missing123"}}"#
+            ),
+        );
+        let deps = crate::paths::DirResolverEnv {
+            platform: "linux".to_string(),
+            env: Default::default(),
+            home: tmp.path().to_string_lossy().to_string(),
+        };
+        let creds = read_ide_credentials_for(&deps, false).unwrap();
+        assert_eq!(creds.client_id, "");
+        assert_eq!(creds.client_secret, "");
+    }
+
+    #[test]
+    fn returns_none_when_access_token_missing() {
+        let tmp = TempDir::new().unwrap();
+        let future_iso = "2099-01-01T00:00:00.000Z";
+        write_token_file(
+            tmp.path(),
+            &format!(r#"{{"refreshToken":"rt","expiresAt":"{future_iso}"}}"#),
+        );
+        let deps = crate::paths::DirResolverEnv {
+            platform: "linux".to_string(),
+            env: Default::default(),
+            home: tmp.path().to_string_lossy().to_string(),
+        };
+        assert!(read_ide_credentials_for(&deps, false).is_none());
+    }
+
+    #[test]
+    fn returns_none_when_refresh_token_missing() {
+        let tmp = TempDir::new().unwrap();
+        let future_iso = "2099-01-01T00:00:00.000Z";
+        write_token_file(
+            tmp.path(),
+            &format!(r#"{{"accessToken":"at","expiresAt":"{future_iso}"}}"#),
+        );
+        let deps = crate::paths::DirResolverEnv {
+            platform: "linux".to_string(),
+            env: Default::default(),
+            home: tmp.path().to_string_lossy().to_string(),
+        };
+        assert!(read_ide_credentials_for(&deps, false).is_none());
+    }
+
+    #[test]
+    fn returns_none_when_expires_at_unparseable() {
+        let tmp = TempDir::new().unwrap();
+        write_token_file(
+            tmp.path(),
+            r#"{"accessToken":"at","refreshToken":"rt","expiresAt":"not-a-date"}"#,
+        );
+        let deps = crate::paths::DirResolverEnv {
+            platform: "linux".to_string(),
+            env: Default::default(),
+            home: tmp.path().to_string_lossy().to_string(),
+        };
+        assert!(read_ide_credentials_for(&deps, false).is_none());
     }
 }
