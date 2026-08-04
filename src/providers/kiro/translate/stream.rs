@@ -181,7 +181,21 @@ pub async fn run_kiro_stream(
     opts: RunStreamOptions<'_>,
     sink: Sender<Result<Bytes, std::io::Error>>,
 ) -> Result<(), KiroStreamError> {
-    run_kiro_stream_impl(opts, sink, None, RetryPolicy::default()).await
+    run_kiro_stream_with_base_url(opts, sink, None).await
+}
+
+/// [`run_kiro_stream`] with the `https://q.{api_region}.amazonaws.com` base
+/// URL overridable. Production always passes `None`; the provider layer
+/// (`providers/kiro/mod.rs`) threads its own override through so its
+/// `stream: true` / `stream: false` branching can be exercised against a mock
+/// backend without duplicating any of this orchestration. Kept separate from
+/// `run_kiro_stream_impl` so the retry policy stays private to this module.
+pub(crate) async fn run_kiro_stream_with_base_url(
+    opts: RunStreamOptions<'_>,
+    sink: Sender<Result<Bytes, std::io::Error>>,
+    base_url_override: Option<&str>,
+) -> Result<(), KiroStreamError> {
+    run_kiro_stream_impl(opts, sink, base_url_override, RetryPolicy::default()).await
 }
 
 /// Internal seam for testing, mirroring the `_impl` convention already used

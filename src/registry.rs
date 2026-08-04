@@ -91,7 +91,7 @@ impl Registry {
                 "kimi" => Arc::new(crate::providers::kimi::KimiProvider::new()),
                 "cursor" => Arc::new(crate::providers::cursor::CursorProvider::new()),
                 "grok" => Arc::new(crate::providers::grok::GrokProvider::new()),
-                "kiro" => Arc::new(PlaceholderProvider::new("kiro", entries.clone())),
+                "kiro" => Arc::new(crate::providers::kiro::KiroProvider::new()),
                 _ => Arc::new(PlaceholderProvider::new(name, entries.clone())),
             };
             handlers.insert(name.clone(), handler);
@@ -411,6 +411,36 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn kiro_is_the_real_provider_not_a_placeholder() {
+        // A `PlaceholderProvider` answers every request with 501; the real
+        // `KiroProvider` rejects an unknown model locally with a 400. Uses an
+        // unknown model deliberately, so the assertion never depends on
+        // credentials or reaches the network.
+        let registry = Registry::new(AliasProvider::Codex);
+        let provider = registry
+            .provider_for_model("kiro:not-a-real-model", None)
+            .expect("kiro provider");
+        let body = MessagesRequest {
+            model: Some("kiro:not-a-real-model".to_string()),
+            max_tokens: Some(16),
+            messages: Vec::new(),
+            stream: false,
+            bypass_provider_model_override: false,
+            extra: serde_json::Map::new(),
+        };
+        let ctx = RequestContext {
+            req_id: "req-registry-kiro-real".to_string(),
+            session_id: None,
+            session_seq: None,
+            provider: "kiro".to_string(),
+            traffic: None,
+            monitor: None,
+        };
+        let response = provider.handle_messages(body, ctx).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
     #[test]
     fn kiro_prefix_routes_to_kiro_even_when_id_collides_with_an_alias() {
         let registry = Registry::new(AliasProvider::Codex);
@@ -443,12 +473,15 @@ mod tests {
     }
 
     #[test]
-    fn kiro_placeholder_never_silently_answers_as_codex() {
+    fn kiro_never_silently_answers_as_codex() {
         let registry = Registry::new(AliasProvider::Codex);
         let p = registry
             .provider_for_model("kiro:deepseek-3-2", None)
             .expect("provider");
-        assert_eq!(p.name(), "kiro"); // fails today if the PlaceholderProvider/Cli default-to-codex bug isn't fixed
+        // Originally a guard against `PlaceholderProvider`/`PlaceholderCli`'s
+        // default-to-codex fallback; still meaningful now that Kiro is real,
+        // since those explicit `"kiro"` arms remain the fallback path.
+        assert_eq!(p.name(), "kiro");
     }
 
     #[test]
