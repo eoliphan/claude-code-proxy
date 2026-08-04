@@ -11,7 +11,7 @@ pub enum KiroAuthMethod {
 pub struct KiroCredentials {
     pub access: String,
     pub refresh: String,
-    pub expires: u64,           // ms since epoch
+    pub expires: u64, // ms since epoch
     pub region: String,
     pub auth_method: KiroAuthMethod,
     #[serde(default, skip_serializing_if = "String::is_empty")]
