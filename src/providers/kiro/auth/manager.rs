@@ -147,11 +147,11 @@ impl<S: AuthStorage<KiroCredentials>> KiroAuthManager<S> {
     /// `rejected_access` is the access token that just got a 401/403 from
     /// the backend — required, not optional, because a caller retrying
     /// after an auth failure always has one. It's threaded all the way
-    /// through `refresh_cascade` so Layers 0, 1, and 5 (the ones that can
-    /// hand back an *existing* credential without ever contacting the
-    /// network) refuse to re-adopt that exact token — see
-    /// `refresh_cascade`'s doc comment for why a value comparison, not just
-    /// singleflight, is necessary here.
+    /// through `refresh_cascade` so every layer that can hand back an
+    /// *existing* credential without ever contacting the network (0, 1, 3,
+    /// and 5) refuses to re-adopt that exact token — see `refresh_cascade`'s
+    /// doc comment for the full per-layer breakdown and why a value
+    /// comparison, not just singleflight, is necessary here.
     pub fn force_refresh(&self, rejected_access: &str) -> Result<KiroCredentials, anyhow::Error> {
         // Note: read the cache into an owned value in its own statement
         // (dropping the `cached` MutexGuard immediately) before ever
@@ -215,8 +215,11 @@ impl<S: AuthStorage<KiroCredentials>> KiroAuthManager<S> {
     /// established by `codex/auth/manager.rs`'s
     /// `CodexAuthManager::force_refresh(&self, rejected_access: &str)`:
     /// `rejected_access` is threaded explicitly from `force_refresh` all the
-    /// way through `refresh_cascade`, and Layers 0, 1, and 5 (see
-    /// `refresh_cascade`) refuse to adopt/extend a candidate whose `access`
+    /// way through `refresh_cascade`, and every layer that can hand back an
+    /// existing credential without contacting the network (0, 1, 3, and 5;
+    /// see `refresh_cascade`'s doc comment for the full breakdown, including
+    /// why 3 needed the same treatment as 1 despite reading the identical
+    /// kiro-cli row) refuses to adopt/extend a candidate whose `access`
     /// equals it. The generation counter still does its job for everything
     /// else (avoiding redundant work when a *different*, non-rejected
     /// credential was concurrently adopted), but it is deliberately not
@@ -244,17 +247,36 @@ impl<S: AuthStorage<KiroCredentials>> KiroAuthManager<S> {
     }
 
     /// `rejected_access` (see `force_refresh`'s doc comment) disqualifies a
-    /// candidate credential whose `access` matches it from Layers 0, 1, and
-    /// 5 — the three layers that can return an *existing* credential
-    /// without ever contacting the network, and so are the only ones that
-    /// could otherwise hand a caller back the exact token it just told us
-    /// was rejected. Layer 2's real refresh isn't gated: it always talks to
-    /// the server and gets back a genuinely new token (or fails), so it
-    /// cannot reproduce the rejected one. Layers 3/3.5/4 aren't gated
-    /// either — they exist specifically to catch kiro-cli having rotated to
-    /// something *different* concurrently, which `expired_cli.refresh !=
-    /// current.refresh` (Layer 4) and the general "kiro-cli moved on" intent
-    /// of 3/3.5 already select for.
+    /// candidate credential whose `access` matches it. Layer-by-layer:
+    ///
+    /// - Layers 0, 1, and 3 read an *existing* kiro-cli/IDE-file credential
+    ///   without ever contacting the network, so each is filtered directly
+    ///   (`!is_rejected_token(...)`) — this is the only thing that can stop
+    ///   them from handing the caller back the exact token it just told us
+    ///   was rejected. Layer 3 in particular reads the *same* kiro-cli DB
+    ///   row Layer 1 already checked: Layer 2's success path always writes
+    ///   our own token into that DB (`save_kiro_cli_credentials_for`), so
+    ///   "kiro-cli's DB holds exactly the token we're currently using" is
+    ///   the steady state, not an edge case — an unfiltered Layer 3 would
+    ///   reliably replay the rejected token right back whenever Layer 2's
+    ///   refresh attempt itself fails (e.g. the token was actually revoked,
+    ///   not just expired), which is exactly the scenario `rejected_access`
+    ///   exists to prevent.
+    /// - Layer 3.5 shells out to kiro-cli to actually perform a refresh
+    ///   before re-reading its DB, so it would normally yield something new
+    ///   on success — but it's filtered anyway (cheap, and removes any
+    ///   dependence on kiro-cli's own refresh actually rotating the token).
+    /// - Layer 4 is filtered implicitly by its own `expired_cli.refresh !=
+    ///   current.refresh` discriminator: if kiro-cli's expired credential
+    ///   has the identical refresh token to the one we're already holding,
+    ///   there is nothing "newer" to retry with regardless of its access
+    ///   token, so Layer 4 already declines to touch it.
+    /// - Layer 2's real refresh isn't gated: it always talks to the server
+    ///   and gets back a genuinely new token (or fails), so it cannot
+    ///   reproduce the rejected one.
+    /// - Layer 5 is filtered directly: extending the rejected token's
+    ///   expiry would falsely mark a token we have direct evidence is bad
+    ///   as "good for longer".
     fn refresh_cascade(
         &self,
         current: &KiroCredentials,
@@ -270,10 +292,16 @@ impl<S: AuthStorage<KiroCredentials>> KiroAuthManager<S> {
             return self.adopt(ide);
         }
         // Layer 1: any currently-valid kiro-cli token (social preferred if
-        // present, else IDC), same rejected-token exclusion as Layer 0.
+        // present, else IDC). Each source is filtered against
+        // rejected_access *before* falling through to the next, not after
+        // the whole chain — so a rejected social token doesn't discard a
+        // still-viable IDC alternative underneath it.
         let precheck = super::kiro_cli::get_kiro_cli_social_token_for(&self.deps)
-            .or_else(|| super::kiro_cli::get_kiro_cli_credentials_for(&self.deps, false))
-            .filter(|creds| !is_rejected_token(&creds.access, rejected_access));
+            .filter(|creds| !is_rejected_token(&creds.access, rejected_access))
+            .or_else(|| {
+                super::kiro_cli::get_kiro_cli_credentials_for(&self.deps, false)
+                    .filter(|creds| !is_rejected_token(&creds.access, rejected_access))
+            });
         if let Some(creds) = precheck {
             return self.adopt(creds);
         }
@@ -286,9 +314,16 @@ impl<S: AuthStorage<KiroCredentials>> KiroAuthManager<S> {
             }
             Err(refresh_err) => {
                 // Layer 3: kiro-cli may have rotated the refresh token
-                // concurrently — re-read its DB once.
+                // concurrently — re-read its DB once. Filtered against
+                // rejected_access: this reads the identical row Layer 1
+                // already checked, and Layer 2's own success path is what
+                // put our (now-rejected) token there in the first place —
+                // see this function's doc comment for why an unfiltered
+                // read here is a real, reachable replay of the rejected
+                // token, not a theoretical concern.
                 if let Some(retry_creds) =
                     super::kiro_cli::get_kiro_cli_credentials_for(&self.deps, false)
+                        .filter(|creds| !is_rejected_token(&creds.access, rejected_access))
                 {
                     return self.adopt(retry_creds);
                 }
@@ -296,11 +331,19 @@ impl<S: AuthStorage<KiroCredentials>> KiroAuthManager<S> {
                 // defined but never called anywhere): ask kiro-cli to
                 // refresh itself, then re-read its DB. Bounded by
                 // refresh_via_kiro_cli's own 15s subprocess timeout (Task 2).
-                if let Some(cli_refreshed) = super::kiro_cli::refresh_via_kiro_cli_for(&self.deps) {
+                // Filtered against rejected_access too, even though a
+                // successful kiro-cli-side refresh would normally yield a
+                // new token anyway.
+                if let Some(cli_refreshed) = super::kiro_cli::refresh_via_kiro_cli_for(&self.deps)
+                    .filter(|creds| !is_rejected_token(&creds.access, rejected_access))
+                {
                     return self.adopt(cli_refreshed);
                 }
                 // Layer 4: kiro-cli may hold a newer (still-expired-to-us)
-                // refresh token; try refreshing with those.
+                // refresh token; try refreshing with those. Implicitly
+                // filtered by `expired_cli.refresh != current.refresh` (see
+                // this function's doc comment) rather than an explicit
+                // rejected_access check.
                 if let Some(expired_cli) =
                     super::kiro_cli::get_kiro_cli_credentials_for(&self.deps, true)
                     && expired_cli.refresh != current.refresh
@@ -655,6 +698,64 @@ mod tests {
             1,
             "Layer 1's rejected kiro-cli token must be skipped, falling through to a real Layer 2 refresh"
         );
+    }
+
+    #[test]
+    fn refresh_cascade_never_replays_the_rejected_token_via_layer_3() {
+        // Finding #1(b), the gap the Layer 1 fix alone didn't cover: Layer
+        // 2's success path always writes our own token into kiro-cli's DB
+        // (save_kiro_cli_credentials_for), so "kiro-cli's DB holds exactly
+        // the token we're currently using" is the steady state, not an
+        // edge case. If that same token then gets rejected and Layer 2's
+        // own refresh attempt also fails (e.g. genuinely revoked, not just
+        // expired), Layer 3 re-reads the identical DB row Layer 1 already
+        // filtered -- without its own filter, it would find the rejected
+        // token again and hand it straight back, exactly the infinite-retry
+        // loop rejected_access exists to prevent, one layer past where the
+        // first fix landed.
+        //
+        // Setup: kiro-cli's DB is the ONLY credential source (no IDE file),
+        // holding exactly the rejected token, and refresh_fn always fails
+        // (simulating Layer 2 failing). The cascade must never resolve to
+        // Ok(rejected-token) -- falling through further (Layer 3.5/4/5) to
+        // an eventual Err is the only acceptable outcome, matching the
+        // real interleaving this scenario models.
+        let tmp = TempDir::new().unwrap();
+        write_kiro_cli_idc_db(tmp.path(), "rejected-token", "2099-01-01T00:00:00.000Z");
+        let deps = deps_for(tmp.path());
+
+        let refresh_fn: Box<RefreshFn> = Box::new(|_current: &KiroCredentials| {
+            Err(anyhow::anyhow!("simulated Layer 2 failure"))
+        });
+
+        let store = InMemoryAuthStore::<KiroCredentials>::default();
+        let manager = KiroAuthManager::with_deps_and_refresh_fn(store, deps, refresh_fn);
+
+        // `refresh` matches write_kiro_cli_idc_db's fixed "cli-refresh"
+        // value, so Layer 4's `expired_cli.refresh != current.refresh`
+        // discriminator also correctly declines (nothing "newer" exists).
+        let current = KiroCredentials {
+            access: "rejected-token".into(),
+            refresh: "cli-refresh".into(),
+            expires: now_ms().saturating_sub(600_000),
+            region: "us-east-1".into(),
+            auth_method: KiroAuthMethod::Idc,
+            client_id: String::new(),
+            client_secret: String::new(),
+            profile_arn: None,
+            expiry_buffer_ms: 0,
+        };
+
+        let result = manager.refresh_cascade(&current, Some("rejected-token"));
+
+        // Failing outright is a safe, acceptable outcome here; only
+        // silently replaying the rejected token is not.
+        if let Ok(creds) = result {
+            assert_ne!(
+                creds.access, "rejected-token",
+                "must never silently return the token that was just rejected"
+            );
+        }
     }
 
     #[test]
