@@ -119,8 +119,23 @@ impl Provider for KiroProvider {
     }
 
     async fn handle_count_tokens(&self, body: MessagesRequest, ctx: RequestContext) -> Response {
-        let raw_model = body.model.as_deref().unwrap_or("auto");
-        let resolved = resolve_model(strip_kiro_prefix(raw_model));
+        self.handle_count_tokens_with(body, ctx, KiroRuntime::production())
+            .await
+    }
+}
+
+impl KiroProvider {
+    async fn handle_count_tokens_with(
+        &self,
+        body: MessagesRequest,
+        ctx: RequestContext,
+        rt: KiroRuntime,
+    ) -> Response {
+        let raw_model = body.model.clone().unwrap_or_else(|| "auto".to_string());
+        let resolved = resolve_model(strip_kiro_prefix(&raw_model));
+        if let Some(rejection) = reject_unavailable_model(&rt, &raw_model, &resolved) {
+            return rejection;
+        }
         if let Some(monitor) = ctx.monitor.as_ref() {
             monitor.model_resolved(&ctx.req_id, &resolved);
         }
@@ -136,9 +151,7 @@ impl Provider for KiroProvider {
         )
             .into_response()
     }
-}
 
-impl KiroProvider {
     async fn handle_messages_with(
         &self,
         mut body: MessagesRequest,
@@ -154,21 +167,8 @@ impl KiroProvider {
         let raw_model = body.model.clone().unwrap_or_else(|| "auto".to_string());
         let resolved = resolve_model(strip_kiro_prefix(&raw_model));
 
-        // Availability is decided per API region, before any network call:
-        // `contains_id` consults what `ListAvailableModels` reported for this
-        // region and falls back to the region-filtered static catalog when
-        // discovery has not run yet. Checking `KIRO_MODELS` membership first
-        // would forward, e.g., a `us-east-1`-only model upstream from an
-        // `eu-central-1` account just because it exists in the catalog.
-        let api_region = api_region_for(&rt.client.auth_manager().store);
-        if !MODEL_CACHE.contains_id(&api_region, &resolved) {
-            return json_error(
-                StatusCode::BAD_REQUEST,
-                "invalid_request_error",
-                format!(
-                    "Model \"{raw_model}\" resolves to \"{resolved}\", which is not available for this Kiro account (API region {api_region})"
-                ),
-            );
+        if let Some(rejection) = reject_unavailable_model(&rt, &raw_model, &resolved) {
+            return rejection;
         }
         // Available, but possibly discovered live with no static template.
         let model_meta = KIRO_MODELS
@@ -303,6 +303,33 @@ impl KiroProvider {
 /// Strips the explicit `kiro:` disambiguation prefix, if present.
 fn strip_kiro_prefix(model: &str) -> &str {
     model.strip_prefix(KIRO_PREFIX).unwrap_or(model)
+}
+
+/// `Some(rejection)` if this account cannot use `resolved`, `None` if it can.
+/// Decided entirely locally — no network call, no auth cascade.
+///
+/// Availability is decided per **API region**: `contains_id` consults what
+/// `ListAvailableModels` reported for that region and falls back to the
+/// region-filtered static catalog when discovery has not run yet. Checking
+/// `KIRO_MODELS` membership instead would forward, say, a `us-east-1`-only
+/// model upstream from an `eu-central-1` account purely because it exists in
+/// the catalog.
+///
+/// Shared by both routes on purpose: answering `count_tokens` with a happy
+/// `200` for a model `/v1/messages` rejects with a `400` would tell a client to
+/// budget for a request it can never make.
+fn reject_unavailable_model(rt: &KiroRuntime, raw_model: &str, resolved: &str) -> Option<Response> {
+    let api_region = api_region_for(&rt.client.auth_manager().store);
+    if MODEL_CACHE.contains_id(&api_region, resolved) {
+        return None;
+    }
+    Some(json_error(
+        StatusCode::BAD_REQUEST,
+        "invalid_request_error",
+        format!(
+            "Model \"{raw_model}\" resolves to \"{resolved}\", which is not available for this Kiro account (API region {api_region})"
+        ),
+    ))
 }
 
 /// Resolved Kiro **API** region for the credential in `store` (not the raw SSO
@@ -1084,11 +1111,34 @@ mod tests {
 
     #[tokio::test]
     async fn count_tokens_reports_a_positive_estimate() {
+        let (client, _tmp) = leaked_test_client("us-east-1");
         let response = KiroProvider::new()
-            .handle_count_tokens(request("kiro:sonnet", false), ctx())
+            .handle_count_tokens_with(
+                request("kiro:sonnet", false),
+                ctx(),
+                test_runtime(client, ""),
+            )
             .await;
         assert_eq!(response.status(), StatusCode::OK);
         let body: Value = serde_json::from_slice(&body_bytes(response).await).unwrap();
         assert!(body["input_tokens"].as_u64().unwrap() > 0);
+    }
+
+    #[tokio::test]
+    async fn count_tokens_rejects_an_unavailable_model_the_same_way_messages_does() {
+        // Both routes must agree on what this account can use: answering
+        // count_tokens with a happy 200 for a model /v1/messages rejects with a
+        // 400 would tell a client to budget for a request it can never make.
+        let (client, _tmp) = leaked_test_client("us-east-1");
+        let response = KiroProvider::new()
+            .handle_count_tokens_with(
+                request("kiro:not-a-real-model", false),
+                ctx(),
+                test_runtime(client, ""),
+            )
+            .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body: Value = serde_json::from_slice(&body_bytes(response).await).unwrap();
+        assert_eq!(body["error"]["type"], "invalid_request_error");
     }
 }
