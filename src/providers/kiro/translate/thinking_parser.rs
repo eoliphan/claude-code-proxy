@@ -119,12 +119,15 @@ pub struct ThinkingTagParser {
     /// for the TS source's `thinkingBlockIndex !== null`). Monotonic: at
     /// most one thinking block is ever extracted per parser instance.
     thinking_started: bool,
-    /// Whether `TextStart` has been pushed yet (this port's stand-in for
-    /// the TS source's `textBlockIndex !== null`, minus the splice-driven
-    /// reset to `null` that the TS source performs after a thinking block
-    /// closes -- see the module doc comment: this port has no
-    /// content-block array to splice, so a text block, once opened, stays
-    /// logically open for the rest of the stream).
+    /// Whether `TextStart` has been pushed yet for the CURRENT text block
+    /// (this port's stand-in for the TS source's `textBlockIndex !== null`).
+    /// Reset to `false` when a thinking block closes (mirrors the TS
+    /// source's `this.textBlockIndex = null;`, source line 145), so text
+    /// arriving after a thinking block always gets a fresh `TextStart` --
+    /// even if a text block was already open before the thinking block
+    /// started. This port has no content-block array to splice/reindex
+    /// like the TS source does, but the observable event-stream behavior
+    /// (a new `TextStart` after every `ThinkingStop`) is preserved exactly.
     text_started: bool,
 }
 
@@ -258,6 +261,18 @@ impl ThinkingTagParser {
             self.text_buffer = self.text_buffer[end_pos + self.active_end_tag.len()..].to_string();
             self.in_thinking = false;
             self.thinking_extracted = true;
+            // Mirrors the TS source's `this.textBlockIndex = null;` (line
+            // 145 of thinking-parser.ts), which runs unconditionally at
+            // this point regardless of whether a text block was already
+            // open. Any text that arrives from here on -- even if a text
+            // block was already open before this thinking block started --
+            // gets a fresh `TextStart` rather than being silently folded
+            // into the earlier block. This is not an edge case: Kiro
+            // routinely sends text before thinking
+            // (`text_then_thinking_then_text_emits_a_new_text_block`
+            // below), and upstream's own test suite documents exactly this
+            // shape as ordinary observed behavior, not adversarial input.
+            self.text_started = false;
             if let Some(rest) = self.text_buffer.strip_prefix("\n\n") {
                 self.text_buffer = rest.to_string();
             }
@@ -650,7 +665,10 @@ mod tests {
     /// A multi-byte character sits immediately before an ambiguous
     /// open-tag-prefix suffix that gets held back across a chunk boundary.
     /// Must not panic on a non-char-boundary slice, and must preserve the
-    /// multi-byte content exactly.
+    /// multi-byte content exactly. The text after the thinking block gets
+    /// its own fresh `TextStart` (a separate text block from the one
+    /// before `<thinking>`) -- see
+    /// `text_then_thinking_then_text_emits_a_new_text_block` for why.
     #[test]
     fn multibyte_utf8_content_at_ambiguous_prefix_boundary_does_not_panic() {
         let mut parser = ThinkingTagParser::new();
@@ -667,6 +685,7 @@ mod tests {
                 ThinkingStart,
                 ThinkingDelta("steam rising".to_string()),
                 ThinkingStop,
+                TextStart,
                 TextDelta("\u{2615} done".to_string()),
             ]
         );
@@ -719,28 +738,29 @@ mod tests {
         );
     }
 
-    /// A second, distinct divergence from the TS source, chosen deliberately
-    /// (documented here rather than silently ported): after a thinking block
-    /// closes, TS resets `textBlockIndex = null` (source line 145), so any
-    /// text that arrives later -- even if a text block was already open
-    /// before the thinking block started -- causes a brand-new `text_start`
-    /// at a new `output.content` index; the earlier and later text runs end
-    /// up as two SEPARATE text blocks, never merged. This port has no
-    /// content-block array to index into (see the module doc comment), and
-    /// `text_started` is intentionally monotonic (never reset), so here a
-    /// text block, once opened, is treated as staying logically open for the
-    /// rest of the stream: later text is a bare `TextDelta` with no second
-    /// `TextStart` in front of it. Either behavior is defensible for this
-    /// index-free event model; this port picked the monotonic one because
-    /// re-emitting a second `TextStart` with no corresponding index concept
-    /// would be meaningless here. Hand-off note for the task that routes
-    /// these events into Anthropic content blocks: a `TextDelta` CAN arrive
-    /// with no immediately-preceding `TextStart` in this exact
-    /// text-then-thinking-then-text shape, and the consumer must treat it as
-    /// a continuation of the earlier (already-open) text block, not an
-    /// error.
+    /// Regression test for a real divergence caught in review (not an
+    /// intentional simplification): after a thinking block closes, the TS
+    /// source resets `textBlockIndex = null` (source line 145) even if a
+    /// text block was already open before the thinking block started, so
+    /// text arriving after `thinking_end` always gets a brand-new
+    /// `text_start`. Confirmed by running the actual TS reference
+    /// (`ThinkingTagParser` from `thinking-parser.ts`) against
+    /// `["Hello ", "<thinking>t</thinking>", "more"]`, which emits
+    /// `text_start(0) ... thinking_end(0) text_start(2)
+    /// text_delta(2)="more"` -- a second `text_start`, not a bare
+    /// continuation delta. This shape is not an edge case: upstream's own
+    /// test suite (`test/thinking-parser.test.ts:181-183`,
+    /// "Text-before-thinking (Kiro API sends text first, thinking after)")
+    /// documents it as ordinary, observed Kiro behavior. `text_started` is
+    /// reset to `false` alongside `thinking_extracted = true` in
+    /// `process_inside_thinking` to reproduce this: this port has no
+    /// content-block array to reindex like the TS source does, but the
+    /// observable event stream (a fresh `TextStart` after every
+    /// `ThinkingStop`) matches. Hand-off note for the task that routes
+    /// these events into Anthropic content blocks: text before AND after a
+    /// thinking block are two SEPARATE text blocks, never merged.
     #[test]
-    fn text_then_thinking_then_text_reuses_the_original_text_block() {
+    fn text_then_thinking_then_text_emits_a_new_text_block() {
         let mut parser = ThinkingTagParser::new();
         let mut events = parser.process_chunk("Hello ");
         events.extend(parser.process_chunk("<thinking>t</thinking>"));
@@ -755,6 +775,7 @@ mod tests {
                 ThinkingStart,
                 ThinkingDelta("t".to_string()),
                 ThinkingStop,
+                TextStart,
                 TextDelta("more".to_string()),
             ]
         );
