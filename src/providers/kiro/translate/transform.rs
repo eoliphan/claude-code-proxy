@@ -151,7 +151,7 @@ pub struct KiroHistoryEntry {
 
 pub const TOOL_RESULT_LIMIT: usize = 250_000;
 
-const TOOL_RESULTS_PROVIDED: &str = "Tool results provided.";
+pub(crate) const TOOL_RESULTS_PROVIDED: &str = "Tool results provided.";
 const TRUNCATION_SEPARATOR: &str = "\n... [TRUNCATED] ...\n";
 pub(crate) const KIRO_ORIGIN: &str = "KIRO_CLI";
 

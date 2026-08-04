@@ -86,9 +86,10 @@ use super::model_allowlist::resolve_model;
 use super::models::{KIRO_MODELS, dash_to_dot};
 use super::transform::{
     self, KIRO_ORIGIN, KiroAssistantResponseMessage, KiroHistoryEntry, KiroToolResult, KiroToolUse,
-    KiroUserInputMessage, KiroUserInputMessageContext, assistant_has_tool_use,
-    assistant_message_contribution, convert_images_to_kiro, convert_tools_to_kiro, extract_images,
-    get_content_text, message_has_tool_result, user_message_contribution,
+    KiroUserInputMessage, KiroUserInputMessageContext, TOOL_RESULTS_PROVIDED,
+    assistant_has_tool_use, assistant_message_contribution, convert_images_to_kiro,
+    convert_tools_to_kiro, extract_images, get_content_text, message_has_tool_result,
+    user_message_contribution,
 };
 
 #[derive(Debug, Clone, Serialize)]
@@ -138,7 +139,15 @@ pub struct BuildRequestOptions<'a> {
 }
 
 /// `xhigh` -> 50_000, `high` -> 30_000, `medium` -> 20_000, everything else
-/// (`low`, `max`, absent) -> 10_000. Research item 7's budget table.
+/// (`low`, `max`, absent) -> 10_000. Research item 7's budget table, taken
+/// literally: the brief names only these four buckets and a catch-all
+/// default, and `"max"` (a valid `translate_shared::read_effort` value) is
+/// never named as its own tier. This means `"max"` maps to the *smallest*
+/// budget (10_000) despite reading as the highest-intensity setting by
+/// name -- flagged here rather than silently "fixed", since deviating from
+/// the brief's literal table without a citation to Kiro's actual reference
+/// behavior (not verified as part of this task) would be a guess in either
+/// direction.
 fn thinking_budget_for(effort: Option<&str>) -> u32 {
     match effort {
         Some("xhigh") => 50_000,
@@ -158,24 +167,62 @@ struct CurrentAssembly {
     tool_results: Vec<KiroToolResult>,
 }
 
+/// What [`collect_leading_tool_results`] found across a run of consecutive
+/// tool-result-shaped messages.
+struct LeadingToolResults {
+    /// Real user-authored text found alongside the tool_result block(s) in
+    /// any of the collected messages (e.g. `[Text("also check X"),
+    /// ToolResult(t1)]` in either block order — see
+    /// `transform::user_message_contribution`'s doc comment on why this
+    /// can't be extracted with `get_content_text`), joined across messages
+    /// with a blank-line separator matching `build_history`'s own
+    /// cross-message join convention. Empty when none of the collected
+    /// messages carried any text of their own.
+    text: String,
+    tool_results: Vec<KiroToolResult>,
+    images: Vec<ImageSource>,
+}
+
 /// Collect every tool-result-shaped message starting at `current[start..]`
-/// (stopping at the first message that isn't), folding each one's tool
-/// results and images via [`user_message_contribution`] so nested
-/// tool-result images and multi-block messages are never silently dropped.
-fn collect_leading_tool_results(
-    current: &[Message],
-    start: usize,
-) -> (Vec<KiroToolResult>, Vec<ImageSource>) {
+/// (stopping at the first message that isn't), folding each one's text,
+/// tool results, and images via [`user_message_contribution`] so nested
+/// tool-result images and multi-block messages — including a user comment
+/// sharing a message with the tool_result it's answering with, in either
+/// block order — are never silently dropped.
+fn collect_leading_tool_results(current: &[Message], start: usize) -> LeadingToolResults {
+    let mut text_parts: Vec<String> = Vec::new();
     let mut tool_results = Vec::new();
     let mut images = Vec::new();
     let mut idx = start;
     while idx < current.len() && message_has_tool_result(&current[idx]) {
         let contribution = user_message_contribution(&current[idx].content);
+        if !contribution.text.is_empty() {
+            text_parts.push(contribution.text);
+        }
         tool_results.extend(contribution.tool_results);
         images.extend(contribution.images);
         idx += 1;
     }
-    (tool_results, images)
+    LeadingToolResults {
+        text: text_parts.join("\n\n"),
+        tool_results,
+        images,
+    }
+}
+
+/// `build_history`'s exact "{text}\n\n{sentinel}" convention (see
+/// `transform::fold_user_contribution`): bare sentinel when there's no
+/// accompanying text, text-then-sentinel otherwise. Any of this module's
+/// three current-message cases can end up with real user text alongside
+/// tool results (a comment sharing a message with the tool_result it
+/// answers, in either block order) and must not silently drop it in favor
+/// of the bare sentinel.
+fn with_tool_results_sentinel(text: &str) -> String {
+    if text.is_empty() {
+        TOOL_RESULTS_PROVIDED.to_string()
+    } else {
+        format!("{text}\n\n{TOOL_RESULTS_PROVIDED}")
+    }
 }
 
 /// Merge a resumed assistant message's `(content, tool_uses)` into
@@ -232,7 +279,6 @@ fn assemble_current_message(
     current: &[Message],
     history: &mut Vec<KiroHistoryEntry>,
 ) -> CurrentAssembly {
-    const TOOL_RESULTS_PROVIDED: &str = "Tool results provided.";
     const PLEASE_PROCEED: &str = "Please proceed with the task.";
 
     let Some(first) = current.first() else {
@@ -244,12 +290,15 @@ fn assemble_current_message(
     };
 
     if message_has_tool_result(first) {
-        // Case 1: lone/leading tool-result-shaped turn.
-        let (tool_results, images) = collect_leading_tool_results(current, 0);
+        // Case 1: lone/leading tool-result-shaped turn. `first` itself can
+        // carry real text alongside its tool_result block(s) (in either
+        // block order) -- collect_leading_tool_results folds that in, it is
+        // NOT dropped in favor of the bare sentinel.
+        let leading = collect_leading_tool_results(current, 0);
         return CurrentAssembly {
-            content_body: TOOL_RESULTS_PROVIDED.to_string(),
-            images,
-            tool_results,
+            content_body: with_tool_results_sentinel(&leading.text),
+            images: leading.images,
+            tool_results: leading.tool_results,
         };
     }
 
@@ -257,38 +306,42 @@ fn assemble_current_message(
         // Case 2: resumed/continued turn.
         let (content, tool_uses) = assistant_message_contribution(&first.content);
         merge_or_push_assistant_entry(history, content, tool_uses);
-        let (tool_results, images) = collect_leading_tool_results(current, 1);
-        let content_body = if tool_results.is_empty() {
+        let leading = collect_leading_tool_results(current, 1);
+        let content_body = if leading.tool_results.is_empty() {
             PLEASE_PROCEED.to_string()
         } else {
-            TOOL_RESULTS_PROVIDED.to_string()
+            with_tool_results_sentinel(&leading.text)
         };
         return CurrentAssembly {
             content_body,
-            images,
-            tool_results,
+            images: leading.images,
+            tool_results: leading.tool_results,
         };
     }
 
     // Case 3: plain user message (guaranteed no tool_result block by
     // construction — see the module doc comment), possibly followed by
     // trailing tool-result message(s) with no intervening assistant
-    // tool_use in this slice.
-    let mut content_body = get_content_text(&first.role, &first.content);
+    // tool_use in this slice. Both the head message's own text AND any
+    // trailing tool-result message's own text must survive.
+    let head_text = get_content_text(&first.role, &first.content);
     let mut images = extract_images(&first.role, &first.content);
-    let (tool_results, trailing_images) = collect_leading_tool_results(current, 1);
-    images.extend(trailing_images);
-    if !tool_results.is_empty() {
-        content_body = if content_body.is_empty() {
-            TOOL_RESULTS_PROVIDED.to_string()
-        } else {
-            format!("{content_body}\n\n{TOOL_RESULTS_PROVIDED}")
+    let leading = collect_leading_tool_results(current, 1);
+    images.extend(leading.images);
+    let content_body = if leading.tool_results.is_empty() {
+        head_text
+    } else {
+        let combined = match (head_text.is_empty(), leading.text.is_empty()) {
+            (true, _) => leading.text,
+            (false, true) => head_text,
+            (false, false) => format!("{head_text}\n\n{}", leading.text),
         };
-    }
+        with_tool_results_sentinel(&combined)
+    };
     CurrentAssembly {
         content_body,
         images,
-        tool_results,
+        tool_results: leading.tool_results,
     }
 }
 
@@ -353,10 +406,25 @@ pub fn build_kiro_request(
     );
     let tools = add_placeholder_tools(declared_tools, &truncated_history);
 
+    // `raw.system_prepended` only records that `build_history` ATTACHED the
+    // system prompt to some history entry -- not that the entry SURVIVED
+    // `sanitize_history`'s leading-strip (an entry carrying tool_results
+    // can never be valid at position 0, and everything can cascade-strip
+    // right along with it, see the module doc comment on case handling
+    // above) or `truncate_history`'s size-based front-eviction. Check
+    // whether the prefix is actually still there in the truncated output;
+    // if not, it must be re-added to the current message regardless of
+    // what the flag says.
+    let system_survived_in_history = raw.system_prepended
+        && system_for_history.as_deref().is_some_and(|sys| {
+            truncated_history
+                .first()
+                .and_then(|e| e.user_input_message.as_ref())
+                .is_some_and(|uim| uim.content.starts_with(sys))
+        });
+
     let mut content = assembly.content_body;
-    if !raw.system_prepended
-        && let Some(sys) = system_for_history.as_deref()
-    {
+    if !system_survived_in_history && let Some(sys) = system_for_history.as_deref() {
         // Same "{sys}\n\n{text}" join `build_history` uses for its own
         // system-prompt prepend, applied uniformly across all three current-
         // message cases (not just the plain-user case) -- `system_prepended`
@@ -585,6 +653,54 @@ mod tests {
         assert!(content.contains("<max_thinking_length>1234</max_thinking_length>"));
     }
 
+    #[test]
+    fn reasoning_enabled_thinking_prefix_lands_on_current_message_beyond_a_single_turn() {
+        // Pins WHERE the thinking-mode prefix ends up once history exists:
+        // history's own entries must NOT carry it (system_for_history is
+        // only ever prepended once, to whichever single place -- history or
+        // current -- actually needs it), and it must still open the current
+        // message's content, not get lost once there's more than one turn.
+        let mut request = req(vec![
+            user(Value::String("hi".to_string())),
+            assistant(Value::String("hello".to_string())),
+            user(Value::String("second turn".to_string())),
+        ]);
+        request
+            .extra
+            .insert("output_config".to_string(), json!({"effort": "high"}));
+        let opts = BuildRequestOptions {
+            conversation_id: "conv-3c",
+            reasoning_enabled: true,
+            thinking_budget: None,
+            profile_arn: None,
+        };
+        let (kiro, _) = build_kiro_request(&request, opts).unwrap();
+
+        let history = kiro
+            .conversation_state
+            .history
+            .as_ref()
+            .expect("multi-turn history should be populated");
+        let first_history_content = &history[0].user_input_message.as_ref().unwrap().content;
+        assert!(
+            first_history_content.starts_with("<thinking_mode>enabled</thinking_mode>"),
+            "the FIRST history entry should carry the prefix (it's where \
+             build_history attaches the system_for_history string when a \
+             prior user message exists): {first_history_content}"
+        );
+
+        let current_content = &kiro
+            .conversation_state
+            .current_message
+            .user_input_message
+            .content;
+        assert_eq!(
+            current_content, "second turn",
+            "the CURRENT message must NOT carry the prefix a second time once \
+             it already survived in history"
+        );
+    }
+
     // ---- model alias resolution ----
 
     #[test]
@@ -733,6 +849,77 @@ mod tests {
         );
     }
 
+    // ---- mixed [Text, ToolResult] current message (Critical regression) ----
+
+    #[test]
+    fn current_message_with_text_then_tool_result_preserves_the_text() {
+        // Regression: a single lone current message shaped [Text,
+        // ToolResult] previously shipped with content hardcoded to the bare
+        // "Tool results provided." sentinel -- the real user comment
+        // sharing the message with the tool_result it's answering with was
+        // silently dropped. This is the exact bug class Task 9 fixed for
+        // HISTORY entries (see transform.rs's module doc comment: "a real
+        // Claude Code turn can lead with a short text comment before the
+        // tool result it's answering with") reintroduced one level up in
+        // current-message assembly.
+        let request = req(vec![user(json!([
+            text_block("also, watch out for X"),
+            tool_result_block("t1", Value::String("r1".to_string())),
+        ]))]);
+        let (kiro, tool_results) = build_kiro_request(&request, base_opts("conv-7b")).unwrap();
+        assert_eq!(
+            kiro.conversation_state
+                .current_message
+                .user_input_message
+                .content,
+            "also, watch out for X\n\nTool results provided."
+        );
+        assert_eq!(tool_results.len(), 1);
+        assert_eq!(tool_results[0].tool_use_id, "t1");
+    }
+
+    #[test]
+    fn current_message_with_tool_result_then_text_preserves_the_text() {
+        // Mirror of the above with the blocks in the opposite order.
+        let request = req(vec![user(json!([
+            tool_result_block("t1", Value::String("r1".to_string())),
+            text_block("also, watch out for X"),
+        ]))]);
+        let (kiro, tool_results) = build_kiro_request(&request, base_opts("conv-7c")).unwrap();
+        assert_eq!(
+            kiro.conversation_state
+                .current_message
+                .user_input_message
+                .content,
+            "also, watch out for X\n\nTool results provided."
+        );
+        assert_eq!(tool_results.len(), 1);
+        assert_eq!(tool_results[0].tool_use_id, "t1");
+    }
+
+    #[test]
+    fn plain_user_message_followed_by_tool_result_message_with_its_own_text_merges_both_texts() {
+        // Case 3's own head text ("hi") AND the trailing tool-result
+        // message's own text ("by the way") must both survive, joined with
+        // the head text first (source order) before the sentinel.
+        let request = req(vec![
+            user(Value::String("hi".to_string())),
+            user(json!([
+                text_block("by the way"),
+                tool_result_block("t1", Value::String("r1".to_string())),
+            ])),
+        ]);
+        let (kiro, tool_results) = build_kiro_request(&request, base_opts("conv-7d")).unwrap();
+        assert_eq!(
+            kiro.conversation_state
+                .current_message
+                .user_input_message
+                .content,
+            "hi\n\nby the way\n\nTool results provided."
+        );
+        assert_eq!(tool_results.len(), 1);
+    }
+
     // ---- profile_arn passthrough / omission ----
 
     #[test]
@@ -760,6 +947,93 @@ mod tests {
         assert!(
             value.get("profileArn").is_none(),
             "profileArn key must be absent, not null: {value}"
+        );
+    }
+
+    #[test]
+    fn serialized_top_level_keys_match_the_briefs_wire_shape_exactly() {
+        // Guards every #[serde(rename = ...)] at once -- a typo in any one
+        // of them would otherwise ship silently (each existing test only
+        // ever reaches into the value it cares about via the typed struct,
+        // never checks the full serialized key set).
+        let mut request = req(vec![
+            user(Value::String("do X".to_string())),
+            assistant(json!([tool_use_block("t1", "Search", json!({}))])),
+            user(json!([tool_result_block(
+                "t1",
+                Value::String("r1".to_string())
+            )])),
+        ]);
+        request.extra.insert(
+            "tools".to_string(),
+            json!([{"name": "Search", "description": "search", "input_schema": {"type": "object", "properties": {}}}]),
+        );
+        let opts = BuildRequestOptions {
+            conversation_id: "conv-9b",
+            reasoning_enabled: false,
+            thinking_budget: None,
+            profile_arn: Some("arn:aws:example:profile/2"),
+        };
+        let (kiro, _) = build_kiro_request(&request, opts).unwrap();
+        let value = serde_json::to_value(&kiro).unwrap();
+
+        let top_level: std::collections::BTreeSet<&str> = value
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(|k| k.as_str())
+            .collect();
+        assert_eq!(
+            top_level,
+            ["conversationState", "profileArn", "agentMode"]
+                .into_iter()
+                .collect(),
+            "top-level KiroRequest keys: {value}"
+        );
+
+        let conv_state = value.get("conversationState").unwrap().as_object().unwrap();
+        let conv_state_keys: std::collections::BTreeSet<&str> =
+            conv_state.keys().map(|k| k.as_str()).collect();
+        assert_eq!(
+            conv_state_keys,
+            [
+                "chatTriggerType",
+                "agentTaskType",
+                "conversationId",
+                "currentMessage",
+                "history",
+            ]
+            .into_iter()
+            .collect(),
+            "KiroConversationState keys: {value}"
+        );
+
+        let current_message = conv_state
+            .get("currentMessage")
+            .unwrap()
+            .as_object()
+            .unwrap();
+        assert_eq!(
+            current_message
+                .keys()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            vec!["userInputMessage"],
+            "CurrentMessage keys: {value}"
+        );
+
+        let uim = current_message
+            .get("userInputMessage")
+            .unwrap()
+            .as_object()
+            .unwrap();
+        let uim_keys: std::collections::BTreeSet<&str> = uim.keys().map(|k| k.as_str()).collect();
+        assert_eq!(
+            uim_keys,
+            ["content", "modelId", "origin", "userInputMessageContext",]
+                .into_iter()
+                .collect(),
+            "KiroUserInputMessage keys (images omitted -- none in this fixture): {value}"
         );
     }
 
@@ -916,6 +1190,100 @@ mod tests {
         assert!(
             content.starts_with("SYS-PROMPT\n\n"),
             "unexpected content: {content}"
+        );
+    }
+
+    #[test]
+    fn system_prompt_survives_when_sanitize_history_strips_the_entry_it_was_prepended_to() {
+        // Important regression: [user([tool_result t0]), assistant("ok"),
+        // user("hi")]. build_history prepends the system prompt to
+        // history[0] and sets system_prepended = true -- but history[0] is
+        // a LEADING user entry carrying tool_results, which
+        // sanitize_history's leading-strip (is_leading_invalid) always
+        // removes, cascading into removing whatever new leading entry is
+        // left too if it also isn't a plain userInputMessage. No size
+        // pressure at all is needed to trigger this -- ordinary sanitation
+        // on three short messages does it. `raw.system_prepended` being
+        // `true` must NOT be trusted as proof the prompt actually reached
+        // the wire.
+        let mut request = req(vec![
+            user(json!([tool_result_block(
+                "t0",
+                Value::String("r0".to_string())
+            )])),
+            assistant(Value::String("ok".to_string())),
+            user(Value::String("hi".to_string())),
+        ]);
+        request
+            .extra
+            .insert("system".to_string(), json!("SYS-PROMPT"));
+        let (kiro, _) = build_kiro_request(&request, base_opts("conv-14b")).unwrap();
+        let content = &kiro
+            .conversation_state
+            .current_message
+            .user_input_message
+            .content;
+        assert!(
+            content.starts_with("SYS-PROMPT\n\n"),
+            "system prompt must survive even though it was stripped out of history \
+             by ordinary sanitization, not size-based truncation: {content}"
+        );
+    }
+
+    #[test]
+    fn system_prompt_survives_when_a_different_entry_ends_up_leading_history() {
+        // Sharper version of the above: after leading-strip, a DIFFERENT
+        // entry (not the one the prefix was attached to) ends up at the
+        // front of history. A naive fix that just checks "is history
+        // non-empty" would wrongly conclude the prompt survived here --
+        // only checking the actual leading entry's content catches this.
+        //
+        // [user([tool_result t0]), assistant("ok"), user("more"),
+        //  assistant("ack"), user("final")]:
+        // history[0] (system-prefixed, carries tool_results) and the
+        // now-leading assistant("ok") both get stripped by
+        // sanitize_history's leading-strip loop; user("more") survives as
+        // the new front, but it never got the system prefix.
+        let mut request = req(vec![
+            user(json!([tool_result_block(
+                "t0",
+                Value::String("r0".to_string())
+            )])),
+            assistant(Value::String("ok".to_string())),
+            user(Value::String("more".to_string())),
+            assistant(Value::String("ack".to_string())),
+            user(Value::String("final".to_string())),
+        ]);
+        request
+            .extra
+            .insert("system".to_string(), json!("SYS-PROMPT"));
+        let (kiro, _) = build_kiro_request(&request, base_opts("conv-14c")).unwrap();
+
+        // Sanity check the scenario: history must be non-empty and its
+        // front entry's content must NOT carry the system prefix, so this
+        // genuinely exercises the "wrong entry survived" branch rather than
+        // the "history went empty" branch already covered above.
+        let history = kiro
+            .conversation_state
+            .history
+            .as_ref()
+            .expect("some history should survive in this fixture");
+        let front = history[0].user_input_message.as_ref().unwrap();
+        assert!(
+            !front.content.starts_with("SYS-PROMPT"),
+            "test fixture assumption violated -- front entry unexpectedly carries the prefix: {}",
+            front.content
+        );
+
+        let content = &kiro
+            .conversation_state
+            .current_message
+            .user_input_message
+            .content;
+        assert!(
+            content.starts_with("SYS-PROMPT\n\n"),
+            "system prompt must be re-added to the current message when a \
+             different, non-prefixed entry ends up leading history: {content}"
         );
     }
 
