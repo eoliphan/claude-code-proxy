@@ -14,6 +14,31 @@
 //! `src/retry.ts`, cross-checked against `test/stream.test.ts`), with the
 //! parts of the port that could not be transcribed literally called out
 //! below.
+//!
+//! **What "cannot be transcribed literally" means here.** The reference
+//! builds an `AssistantMessage` *array* and pushes snapshot events at its
+//! consumer, so it can freely mutate content it has already "emitted".
+//! Anthropic's SSE protocol cannot: once a `content_block_delta` is on the
+//! wire it is the client's, and once an index is stopped nothing may follow
+//! it. Three reference behaviors are therefore deliberately **not** ported,
+//! each of which is a post-hoc mutation of already-produced content:
+//!
+//! - `parseBracketToolCalls` (`stream.ts:670-693`) — a fallback that, when a
+//!   turn produced no native tool calls, re-parses the finished text for
+//!   bracket-syntax tool calls, strips them out of the text block, and emits
+//!   them as real tool calls. Porting it faithfully would mean either
+//!   retracting text already streamed, or withholding all text until the
+//!   stream ends (destroying incremental delivery, the entire point of this
+//!   module's channel-based output). Consequence: a model that emits
+//!   bracket-syntax tool calls has them delivered to the client as ordinary
+//!   text with `stop_reason: "end_turn"`. No port of
+//!   `bracket-tool-parser.ts` exists in this codebase, and none is planned.
+//! - Blanking a `"continue"`/dots-only text block when tool calls *were*
+//!   emitted (`stream.ts:694-703`) — same problem, same reason.
+//! - Retrying an echo-loop response (`stream.ts:746-758`) — see the
+//!   empty/echo check below; an echo response is by definition non-empty text
+//!   that was streamed the moment it arrived, so it is detected and logged
+//!   rather than retried.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -210,6 +235,18 @@ async fn drive(
         // --- Endpoint and profile resolution, re-done every iteration: a
         // refreshed credential can carry a different region, and a
         // cache invalidation has to be picked back up.
+        //
+        // Note that `post_generate_assistant_response` resolves credentials
+        // again for its own `Authorization` header, so in principle a refresh
+        // completing between these two reads could sign the request with a
+        // newer token than the one that shaped the endpoint/profile (and than
+        // the one handed to `force_refresh` as `rejected_access` below).
+        // Both reads hit the same manager cache, so the window is a few
+        // microseconds wide, and the outcome is self-correcting: the next
+        // outer iteration reads the newer credential and rejects the right
+        // token. Closing it entirely would mean passing resolved credentials
+        // into the client, i.e. changing Task 13's deliberately minimal
+        // single-attempt API.
         let creds = get_auth(Arc::clone(&auth_manager))
             .await
             .map_err(|e| FlowError::Terminal(KiroStreamError::Auth(e)))?;
@@ -333,6 +370,15 @@ async fn drive(
         // Two buffers, not one: `pending_bytes` holds an undecoded partial
         // UTF-8 sequence from the previous network read, `text_buffer` holds
         // decoded text whose JSON event is not complete yet.
+        //
+        // `pending_bytes` is bounded by construction (at most one incomplete
+        // UTF-8 sequence survives a `decode_chunk` call). `text_buffer` is
+        // not: an upstream that opens a recognized event and trickles bytes
+        // without ever closing it keeps resetting the per-chunk deadline
+        // while the buffer grows and is rescanned. That is inherited from the
+        // reference (which has the identical `buffer = remaining` loop), and
+        // is bounded in practice by the upstream being AWS's own service, not
+        // an arbitrary peer.
         let mut pending_bytes: Vec<u8> = Vec::new();
         let mut text_buffer = String::new();
         let mut first_token_received = false;
@@ -537,6 +583,15 @@ async fn route_event(
             // Kiro sometimes repeats the immediately-previous content event
             // verbatim. Only *consecutive* duplicates are dropped: a repeat
             // separated by a different content event is real output.
+            //
+            // "Consecutive" is measured against the previous *content* event,
+            // not the previous event of any kind — `last_content` is only
+            // ever written here, so an intervening tool-use or usage event
+            // does not reset it. That is the reference's own behavior
+            // (`stream.ts:597`, where `lastContentData` is likewise only
+            // assigned in the content case), and it is what
+            // `duplicate_content_separated_only_by_a_tool_call_is_still_deduplicated`
+            // pins.
             if state.last_content.as_deref() == Some(text.as_str()) {
                 return Ok(());
             }
@@ -1023,15 +1078,27 @@ async fn force_refresh(
     tokio::task::spawn_blocking(move || manager.force_refresh(&rejected_access)).await?
 }
 
-/// Cached-first profile resolution. A resolution failure is treated exactly
-/// like "this account has no profile" (omit `profileArn` and proceed) —
-/// never a reason to fail the in-flight user request, per
-/// `fetch_available_profile_arn`'s own doc comment.
+/// Profile resolution, in the reference's precedence order: the credential's
+/// own ARN first, then the per-endpoint cache, then a `ListAvailableProfiles`
+/// lookup. A resolution failure is treated exactly like "this account has no
+/// profile" (omit `profileArn` and proceed) — never a reason to fail the
+/// in-flight user request, per `fetch_available_profile_arn`'s own doc
+/// comment.
+///
+/// The credential check has to come before the cache read, not after: the
+/// cache is keyed by *endpoint*, so a credential rotated to a different
+/// account in the same region would otherwise keep sending the previous
+/// account's cached ARN (burning an auth retry before the 401/403 handler
+/// invalidates it). The reference has the same precedence —
+/// `getCliProfileArn(accessToken) || resolveProfileArn(...)`, `stream.ts:255`.
 async fn resolve_profile_arn(
     creds: &KiroCredentials,
     endpoint: &str,
     base_url_override: Option<&str>,
 ) -> Option<String> {
+    if let Some(arn) = &creds.profile_arn {
+        return Some(arn.clone());
+    }
     if let Some(cached) = PROFILE_CACHE.get(endpoint) {
         return Some(cached);
     }
@@ -1183,7 +1250,15 @@ mod tests {
         status: u16,
         extra_headers: Vec<(String, String)>,
         parts: Vec<(Duration, Vec<u8>)>,
+        /// When set, a part whose delay is [`GATE`] is withheld until the test
+        /// flips this flag (or [`GATE_TIMEOUT`] elapses, so a regression fails
+        /// the assertion instead of hanging CI).
+        gate: Option<Arc<AtomicBool>>,
     }
+
+    /// Sentinel delay meaning "wait for `Script::gate`", not "sleep this long".
+    const GATE: Duration = Duration::MAX;
+    const GATE_TIMEOUT: Duration = Duration::from_secs(3);
 
     impl Script {
         fn ok(body: &str) -> Self {
@@ -1205,6 +1280,7 @@ mod tests {
                 status,
                 extra_headers: Vec::new(),
                 parts,
+                gate: None,
             }
         }
 
@@ -1215,6 +1291,11 @@ mod tests {
         fn with_header(mut self, name: &str, value: &str) -> Self {
             self.extra_headers
                 .push((name.to_string(), value.to_string()));
+            self
+        }
+
+        fn with_gate(mut self, gate: Arc<AtomicBool>) -> Self {
+            self.gate = Some(gate);
             self
         }
     }
@@ -1350,7 +1431,17 @@ mod tests {
                         }
                         let _ = stream.flush();
                         for (delay, bytes) in &script.parts {
-                            if !delay.is_zero() {
+                            if *delay == GATE {
+                                let deadline = std::time::Instant::now() + GATE_TIMEOUT;
+                                while std::time::Instant::now() < deadline
+                                    && !script
+                                        .gate
+                                        .as_ref()
+                                        .is_some_and(|g| g.load(Ordering::SeqCst))
+                                {
+                                    std::thread::sleep(Duration::from_millis(5));
+                                }
+                            } else if !delay.is_zero() {
                                 std::thread::sleep(*delay);
                             }
                             if stream.write_all(bytes).is_err() {
@@ -1499,6 +1590,10 @@ mod tests {
     /// Runs the stream against a mock server, draining the sink concurrently
     /// (so the channel never backpressures) and returning the terminal result
     /// plus every emitted SSE byte.
+    ///
+    /// Every stream produced through this helper is checked against
+    /// [`assert_valid_anthropic_sse`], so no individual test can pass while
+    /// emitting a malformed frame sequence.
     async fn run_case(case: RunCase<'_>) -> (Result<(), KiroStreamError>, Vec<u8>) {
         let (tx, mut rx) = tokio::sync::mpsc::channel(256);
         let opts = RunStreamOptions {
@@ -1518,7 +1613,9 @@ mod tests {
             }
             out
         };
-        tokio::join!(run, drain)
+        let (result, sse) = tokio::join!(run, drain);
+        assert_valid_anthropic_sse(&sse);
+        (result, sse)
     }
 
     /// The common shape: no reasoning, fast timeouts, fast retries.
@@ -1610,32 +1707,89 @@ mod tests {
             .collect()
     }
 
-    /// Asserts the Anthropic SSE contract that a stopped content block never
-    /// receives another event.
-    fn assert_no_event_after_block_stop(sse: &[u8]) {
-        let mut stopped: Vec<u64> = Vec::new();
-        for (name, data) in frames(sse) {
+    /// Full Anthropic SSE well-formedness check, not just "no event after a
+    /// stop": exactly one `message_start` and it comes first; blocks never
+    /// overlap; every index is fresh, is stopped exactly once, and receives no
+    /// event afterwards; deltas only target the currently-open block; nothing
+    /// is left open at the end; and the stream ends with `message_stop`
+    /// (normal) or `error` (abnormal termination, where an open block is
+    /// expected).
+    fn assert_valid_anthropic_sse(sse: &[u8]) {
+        let all = frames(sse);
+        let names = frame_names(sse);
+        if all.is_empty() {
+            return;
+        }
+        assert_eq!(
+            names.iter().filter(|n| *n == "message_start").count(),
+            1,
+            "exactly one message_start per request: {names:?}"
+        );
+        assert_eq!(
+            names.first().map(String::as_str),
+            Some("message_start"),
+            "message_start must come first: {names:?}"
+        );
+        let ended_abnormally = names.last().map(String::as_str) == Some("error");
+        if !ended_abnormally {
+            assert_eq!(
+                names.last().map(String::as_str),
+                Some("message_stop"),
+                "a normal stream ends with message_stop: {names:?}"
+            );
+        }
+
+        let mut open: Option<u64> = None;
+        let mut seen: Vec<u64> = Vec::new();
+        for (name, data) in &all {
             let index = data["index"].as_u64();
             match name.as_str() {
+                "content_block_start" => {
+                    let index = index.expect("start carries an index");
+                    assert!(
+                        open.is_none(),
+                        "block {index} started while block {:?} was still open: {names:?}",
+                        open
+                    );
+                    assert!(
+                        !seen.contains(&index),
+                        "block index {index} reused: {names:?}"
+                    );
+                    seen.push(index);
+                    open = Some(index);
+                }
+                "content_block_delta" => {
+                    let index = index.expect("delta carries an index");
+                    assert_eq!(
+                        open,
+                        Some(index),
+                        "delta for block {index} while {:?} was open: {names:?}",
+                        open
+                    );
+                }
                 "content_block_stop" => {
                     let index = index.expect("stop carries an index");
-                    assert!(
-                        !stopped.contains(&index),
-                        "block {index} stopped twice: {:?}",
-                        frame_names(sse)
+                    assert_eq!(
+                        open,
+                        Some(index),
+                        "stop for block {index} while {:?} was open: {names:?}",
+                        open
                     );
-                    stopped.push(index);
+                    open = None;
                 }
-                "content_block_delta" | "content_block_start" => {
-                    let index = index.expect("block event carries an index");
-                    assert!(
-                        !stopped.contains(&index),
-                        "block {index} received {name} after its content_block_stop: {:?}",
-                        frame_names(sse)
-                    );
-                }
+                "message_delta" | "message_stop" => assert!(
+                    open.is_none(),
+                    "block {:?} was never stopped before {name}: {names:?}",
+                    open
+                ),
                 _ => {}
             }
+        }
+        if !ended_abnormally {
+            assert!(
+                open.is_none(),
+                "block {open:?} left open at the end of the stream: {names:?}"
+            );
         }
     }
 
@@ -1676,7 +1830,6 @@ mod tests {
         let delta = find_frame(&sse, "message_delta").unwrap();
         assert_eq!(delta["delta"]["stop_reason"], "end_turn");
         assert!(delta["usage"]["output_tokens"].as_u64().unwrap() > 0);
-        assert_no_event_after_block_stop(&sse);
     }
 
     // ==================================================================
@@ -1685,15 +1838,23 @@ mod tests {
 
     #[tokio::test]
     async fn frames_reach_the_sink_before_the_upstream_finishes_writing() {
+        // Deterministic, not timing-based: the upstream physically cannot
+        // finish its response until this test has already received frames,
+        // because the last part is withheld until the test releases the gate.
+        // An implementation that buffered internally would deliver nothing
+        // before the gate, and the gate would never be released — bounded by
+        // GATE_TIMEOUT so that failure shows up as a failed assertion rather
+        // than a hung suite.
+        let release = Arc::new(AtomicBool::new(false));
         let server = spawn_kiro_mock(
-            vec![Script::chunks(vec![
-                (Duration::ZERO, r#"{"content":"Hello"}"#),
-                (Duration::from_millis(30), r#"{"content":" world"}"#),
-                (
-                    Duration::from_millis(600),
-                    r#"{"contextUsagePercentage":5}"#,
-                ),
-            ])],
+            vec![
+                Script::chunks(vec![
+                    (Duration::ZERO, r#"{"content":"Hello"}"#),
+                    (Duration::from_millis(20), r#"{"content":" world"}"#),
+                    (GATE, r#"{"contextUsagePercentage":5}"#),
+                ])
+                .with_gate(Arc::clone(&release)),
+            ],
             None,
         );
         let (client, _tmp) = test_client("tok", "us-east-1", Some("arn:test"));
@@ -1718,6 +1879,11 @@ mod tests {
                     early += 1;
                 }
                 all.extend_from_slice(&item.unwrap());
+                // Two text deltas received means real incremental delivery;
+                // let the upstream finish so the stream can complete.
+                if early >= 4 {
+                    release.store(true, Ordering::SeqCst);
+                }
             }
             (early, all)
         };
@@ -1725,11 +1891,13 @@ mod tests {
 
         result.expect("stream should succeed");
         assert!(
-            early >= 2,
-            "expected at least 2 frames delivered before the upstream finished writing, got {early} (frames: {:?})",
+            early >= 4,
+            "expected message_start + content_block_start + 2 text deltas before the \
+             upstream finished writing, got {early} (frames: {:?})",
             frame_names(&sse)
         );
         assert_eq!(text_deltas(&sse).concat(), "Hello world");
+        assert_valid_anthropic_sse(&sse);
     }
 
     // ==================================================================
@@ -1758,7 +1926,6 @@ mod tests {
         assert_eq!(tool_inputs(&sse), vec!["{}".to_string()]);
         let delta = find_frame(&sse, "message_delta").unwrap();
         assert_eq!(delta["delta"]["stop_reason"], "tool_use");
-        assert_no_event_after_block_stop(&sse);
     }
 
     // ==================================================================
@@ -1882,7 +2049,6 @@ mod tests {
         assert_eq!(all[text_start].1["index"], 1);
         assert_eq!(thinking_deltas(&sse).concat(), "reasoning");
         assert_eq!(text_deltas(&sse).concat(), "answer");
-        assert_no_event_after_block_stop(&sse);
     }
 
     #[tokio::test]
@@ -1912,7 +2078,6 @@ mod tests {
 
         result.expect("unterminated thinking should still finish cleanly");
         assert_eq!(thinking_deltas(&sse).concat(), "abc</think");
-        assert_no_event_after_block_stop(&sse);
         let names = frame_names(&sse);
         let last_delta = names
             .iter()
@@ -2466,7 +2631,6 @@ mod tests {
                 .count(),
             1
         );
-        assert_no_event_after_block_stop(&sse);
     }
 
     #[tokio::test]
@@ -2569,7 +2733,6 @@ mod tests {
             ]
         );
         assert_eq!(text_deltas(&sse), vec!["before", "after"]);
-        assert_no_event_after_block_stop(&sse);
     }
 
     #[tokio::test]
@@ -2782,6 +2945,112 @@ mod tests {
 
         result.expect("a disconnected client is not a stream failure");
         assert_eq!(server.generate_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn duplicate_content_separated_only_by_a_tool_call_is_still_deduplicated() {
+        // Pins the exact dedup semantics rather than leaving them implicit:
+        // "consecutive" is measured against the previous *content* event, so
+        // a tool-use event between two identical content events does NOT make
+        // them distinct. This mirrors the reference (`lastContentData` is only
+        // assigned in its content branch) and is the behavior the plan's
+        // "with a different event in between" prose would get wrong if read
+        // as "any event".
+        let server = spawn_kiro_mock(
+            vec![Script::ok(
+                r#"{"content":"same"}{"name":"t","toolUseId":"tc1","input":"{}","stop":true}{"content":"same"}{"contextUsagePercentage":5}"#,
+            )],
+            None,
+        );
+        let (client, _tmp) = test_client("tok", "us-east-1", Some("arn:test"));
+        let req = sample_request();
+
+        let (result, sse) = run_simple(&server, &client, &req).await;
+
+        result.expect("stream should succeed");
+        assert_eq!(text_deltas(&sse), vec!["same"]);
+    }
+
+    #[tokio::test]
+    async fn stall_and_empty_retries_draw_on_one_shared_budget() {
+        // Discriminating test for the shared outer counter: two stream-error
+        // attempts followed by two empty attempts is exactly 4 requests only
+        // if all four classes share one budget of 3. Separate per-class
+        // counters would let the empty responses retry again (5+ requests).
+        let server = spawn_kiro_mock(
+            vec![
+                Script::ok(r#"{"error":"InternalServerException","message":"boom"}"#),
+                Script::ok(r#"{"error":"InternalServerException","message":"boom"}"#),
+                Script::ok(r#"{"contextUsagePercentage":5}"#),
+                Script::ok(r#"{"contextUsagePercentage":5}"#),
+            ],
+            None,
+        );
+        let (client, _tmp) = test_client("tok", "us-east-1", Some("arn:test"));
+        let req = sample_request();
+
+        let (result, sse) = run_simple(&server, &client, &req).await;
+
+        result.expect("the last empty response is surfaced, not failed");
+        assert_eq!(
+            server.generate_count(),
+            4,
+            "2 stall retries + 1 empty retry exhausts one shared budget of 3"
+        );
+        assert!(text_deltas(&sse).is_empty());
+    }
+
+    #[tokio::test]
+    async fn the_capacity_budget_resets_on_every_outer_iteration() {
+        // Two capacity retries, then a stream error that sends the request
+        // back through the outer loop, then two more capacity retries. That
+        // second pair only survives if the capacity counter was reset — a
+        // counter carried across outer iterations would hit its budget of 3
+        // and turn the sixth request into a terminal NonRetryable.
+        let server = spawn_kiro_mock(
+            vec![
+                Script::error(500, r#"{"reason":"INSUFFICIENT_MODEL_CAPACITY"}"#),
+                Script::error(500, r#"{"reason":"INSUFFICIENT_MODEL_CAPACITY"}"#),
+                Script::ok(r#"{"error":"InternalServerException","message":"boom"}"#),
+                Script::error(500, r#"{"reason":"INSUFFICIENT_MODEL_CAPACITY"}"#),
+                Script::error(500, r#"{"reason":"INSUFFICIENT_MODEL_CAPACITY"}"#),
+                Script::ok(r#"{"content":"finally"}{"contextUsagePercentage":5}"#),
+            ],
+            None,
+        );
+        let (client, _tmp) = test_client("tok", "us-east-1", Some("arn:test"));
+        let req = sample_request();
+
+        let (result, sse) = run_simple(&server, &client, &req).await;
+
+        result.expect("the sixth attempt should succeed");
+        assert_eq!(server.generate_count(), 6);
+        assert_eq!(text_deltas(&sse).concat(), "finally");
+    }
+
+    /// Task 17 will hand this future to axum/`tokio::spawn`, both of which
+    /// require `Send`. A `std::sync` guard accidentally held across an `await`
+    /// (the profile cache is a `RwLock`) would silently break that there
+    /// rather than here, so it is pinned at this layer. The future is
+    /// constructed but never polled — no network is touched.
+    #[test]
+    fn the_stream_future_is_send() {
+        fn assert_send<F: Send>(_: F) {}
+        let (client, _tmp) = test_client("tok", "us-east-1", Some("arn:test"));
+        let req = sample_request();
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        assert_send(run_kiro_stream(
+            RunStreamOptions {
+                client: &client,
+                model: sample_model(),
+                req: &req,
+                message_id: "msg_kiro_test",
+                conversation_id: "conv-fixed-for-the-whole-request",
+                reasoning_enabled: false,
+                timeouts: StreamTimeouts::default(),
+            },
+            tx,
+        ));
     }
 
     #[test]
