@@ -1,3 +1,4 @@
+pub mod kiro_cli;
 pub mod kiro_credentials;
 pub mod kiro_ide;
 
