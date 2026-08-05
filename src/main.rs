@@ -66,6 +66,11 @@ enum Commands {
         #[command(subcommand)]
         command: ProviderGroup,
     },
+    /// Manage Kiro authentication
+    Kiro {
+        #[command(subcommand)]
+        command: ProviderGroup,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -165,6 +170,7 @@ fn main() -> Result<()> {
         Commands::Kimi { command } => run_provider_cli("kimi", command),
         Commands::Cursor { command } => run_provider_cli("cursor", command),
         Commands::Grok { command } => run_provider_cli("grok", command),
+        Commands::Kiro { command } => run_provider_cli("kiro", command),
     }
 }
 
@@ -224,7 +230,7 @@ fn run_provider_cli(name: &str, command: ProviderGroup) -> Result<()> {
 
 fn print_models(registry: &Registry, full: bool) {
     let grouped = registry.grouped_models();
-    for provider in ["codex", "kimi", "grok", "cursor"] {
+    for provider in ["codex", "kimi", "grok", "cursor", "kiro"] {
         let Some(models) = grouped.get(provider) else {
             continue;
         };
