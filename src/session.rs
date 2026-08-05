@@ -80,6 +80,7 @@ pub(crate) fn record_session_request_with_affinity_update(
         next.affinity_provider = Some(match provider_name {
             "codex" => AliasProvider::Codex,
             "kimi" => AliasProvider::Kimi,
+            "kiro" => AliasProvider::Kiro,
             _ => next.affinity_provider.unwrap_or(AliasProvider::Codex),
         });
     }
@@ -100,8 +101,13 @@ pub(crate) fn record_session_request_with_affinity_update(
     Some(next)
 }
 
+/// Providers a bare Anthropic-style alias can be routed to, and therefore the
+/// only ones worth pinning session affinity on. Kiro joined this set once it
+/// stopped being a `PlaceholderProvider`: `AliasProvider::Kiro` is a real,
+/// configurable alias target, so a session that used a concrete Kiro model
+/// must keep its later alias requests on Kiro.
 fn is_alias_routable_provider(name: &str) -> bool {
-    matches!(name, "codex" | "kimi")
+    matches!(name, "codex" | "kimi" | "kiro")
 }
 
 #[cfg(test)]
@@ -118,6 +124,30 @@ pub fn affinity_provider_from_session(session: &SessionState) -> Option<AliasPro
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_concrete_kiro_model_pins_session_affinity_to_kiro() {
+        // Kiro is a real provider *and* a valid `AliasProvider`, so a session
+        // that used a concrete Kiro model must keep subsequent bare-alias
+        // requests on Kiro instead of falling back to the configured global
+        // alias provider.
+        // `deepseek-3-2` is Kiro-only and absent from `ANTHROPIC_STYLE_ALIASES`,
+        // so it is a genuine affinity-establishing request.
+        let session_id = "session-affinity-kiro-test";
+        let state = record_session_request(Some(session_id), None, "kiro", "deepseek-3-2", 1)
+            .expect("session");
+        assert_eq!(state.affinity_provider, Some(AliasProvider::Kiro));
+    }
+
+    #[test]
+    fn a_bare_alias_answered_by_kiro_does_not_pin_affinity() {
+        // Mirrors the codex/kimi rule: an alias request is *routed* by the
+        // existing affinity, so it must never establish one.
+        let session_id = "session-affinity-kiro-alias-test";
+        let state =
+            record_session_request(Some(session_id), None, "kiro", "sonnet", 1).expect("session");
+        assert_eq!(state.affinity_provider, None);
+    }
 
     #[test]
     fn auxiliary_request_does_not_change_session_affinity() {

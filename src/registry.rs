@@ -26,6 +26,8 @@ pub const ANTHROPIC_STYLE_ALIASES: &[&str] = &[
 
 pub const CURSOR_PREFIXES: &[&str] = &["cursor:", "cursor-plan:", "cursor-ask:"];
 
+pub const KIRO_PREFIX: &str = "kiro:";
+
 const CURSOR_LEGACY_MODELS: &[&str] = &[
     "cursor",
     "cursor-agent",
@@ -74,6 +76,13 @@ impl Registry {
                 .map(|model| (*model).to_string())
                 .collect(),
         );
+        models.insert(
+            "kiro".into(),
+            crate::providers::kiro::translate::models::KIRO_MODELS
+                .iter()
+                .map(|m| m.id.to_string())
+                .collect(),
+        );
 
         let mut handlers = BTreeMap::new();
         for (name, entries) in &models {
@@ -82,6 +91,7 @@ impl Registry {
                 "kimi" => Arc::new(crate::providers::kimi::KimiProvider::new()),
                 "cursor" => Arc::new(crate::providers::cursor::CursorProvider::new()),
                 "grok" => Arc::new(crate::providers::grok::GrokProvider::new()),
+                "kiro" => Arc::new(crate::providers::kiro::KiroProvider::new()),
                 _ => Arc::new(PlaceholderProvider::new(name, entries.clone())),
             };
             handlers.insert(name.clone(), handler);
@@ -145,6 +155,9 @@ impl Registry {
         session_affinity: Option<&AliasProvider>,
     ) -> Option<Arc<dyn Provider>> {
         let normalized = normalize_incoming_model(raw_model);
+        if is_kiro_model(&normalized) {
+            return self.handlers.get("kiro").cloned();
+        }
         if is_anthropic_alias(&normalized) {
             let target = session_affinity.unwrap_or(&self.alias_provider);
             return self.handlers.get(target.as_str()).cloned();
@@ -195,6 +208,20 @@ pub fn is_cursor_model(model: &str) -> bool {
         .any(|prefix| model.starts_with(prefix))
 }
 
+/// True only for the explicit `kiro:` disambiguation prefix. Deliberately
+/// narrow: bare, unprefixed Kiro model IDs that don't collide with
+/// `ANTHROPIC_STYLE_ALIASES` already route correctly via the linear scan
+/// over `self.models["kiro"]` in `provider_for_model`, so this doesn't also
+/// need to check the static/dynamic catalog — that would just duplicate
+/// what the linear scan already does. Its only job is recognizing the
+/// prefix, mirroring `is_cursor_model`'s role for `CURSOR_PREFIXES`.
+pub fn is_kiro_model(model: &str) -> bool {
+    if let Some(stripped) = model.strip_prefix(KIRO_PREFIX) {
+        return !stripped.is_empty();
+    }
+    false
+}
+
 struct PlaceholderProvider {
     name: &'static str,
     models: Vec<String>,
@@ -207,6 +234,7 @@ impl PlaceholderProvider {
             "kimi" => "kimi",
             "cursor" => "cursor",
             "grok" => "grok",
+            "kiro" => "kiro",
             _ => "codex",
         };
         Self { name, models }
@@ -229,6 +257,7 @@ impl Provider for PlaceholderProvider {
             "kimi" => &KIMI_CLI,
             "cursor" => &CURSOR_CLI,
             "grok" => &GROK_CLI,
+            "kiro" => &KIRO_CLI,
             _ => &CODEX_CLI,
         }
     }
@@ -288,6 +317,7 @@ const CODEX_CLI: PlaceholderCli = PlaceholderCli { provider: "codex" };
 const KIMI_CLI: PlaceholderCli = PlaceholderCli { provider: "kimi" };
 const CURSOR_CLI: PlaceholderCli = PlaceholderCli { provider: "cursor" };
 const GROK_CLI: PlaceholderCli = PlaceholderCli { provider: "grok" };
+const KIRO_CLI: PlaceholderCli = PlaceholderCli { provider: "kiro" };
 
 fn expand_codex_models() -> Vec<String> {
     let mut set = HashSet::new();
@@ -379,5 +409,85 @@ mod tests {
                 .name(),
             "cursor"
         );
+    }
+
+    #[tokio::test]
+    async fn kiro_is_the_real_provider_not_a_placeholder() {
+        // A `PlaceholderProvider` answers every request with 501; the real
+        // `KiroProvider` rejects an unknown model locally with a 400. Uses an
+        // unknown model deliberately, so the assertion never depends on
+        // credentials or reaches the network.
+        let registry = Registry::new(AliasProvider::Codex);
+        let provider = registry
+            .provider_for_model("kiro:not-a-real-model", None)
+            .expect("kiro provider");
+        let body = MessagesRequest {
+            model: Some("kiro:not-a-real-model".to_string()),
+            max_tokens: Some(16),
+            messages: Vec::new(),
+            stream: false,
+            bypass_provider_model_override: false,
+            extra: serde_json::Map::new(),
+        };
+        let ctx = RequestContext {
+            req_id: "req-registry-kiro-real".to_string(),
+            session_id: None,
+            session_seq: None,
+            provider: "kiro".to_string(),
+            traffic: None,
+            monitor: None,
+        };
+        let response = provider.handle_messages(body, ctx).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn kiro_prefix_routes_to_kiro_even_when_id_collides_with_an_alias() {
+        let registry = Registry::new(AliasProvider::Codex);
+        // "claude-sonnet-4-6" is BOTH a real Kiro model id AND an ANTHROPIC_STYLE_ALIASES entry —
+        // the prefix must win regardless of which provider is configured as the alias target.
+        let p = registry.provider_for_model("kiro:claude-sonnet-4-6", None);
+        assert_eq!(p.expect("provider").name(), "kiro");
+    }
+
+    #[test]
+    fn bare_colliding_model_id_still_honors_alias_routing() {
+        // Without the prefix, the existing alias-routing behavior for shared literal names is unchanged —
+        // this proves the fix is additive, not a regression on existing routing semantics.
+        let registry = Registry::new(AliasProvider::Codex);
+        let p = registry.provider_for_model("claude-sonnet-4-6", None);
+        assert_eq!(p.expect("provider").name(), "codex");
+    }
+
+    #[test]
+    fn kiro_as_alias_provider_routes_bare_aliases_to_kiro() {
+        let registry = Registry::new(AliasProvider::Kiro);
+        for model in ["sonnet", "opus", "haiku", "claude-sonnet-5"] {
+            let p = registry.provider_for_model(model, None);
+            assert_eq!(
+                p.expect("provider").name(),
+                "kiro",
+                "{model} should route to kiro"
+            );
+        }
+    }
+
+    #[test]
+    fn kiro_never_silently_answers_as_codex() {
+        let registry = Registry::new(AliasProvider::Codex);
+        let p = registry
+            .provider_for_model("kiro:deepseek-3-2", None)
+            .expect("provider");
+        // Originally a guard against `PlaceholderProvider`/`PlaceholderCli`'s
+        // default-to-codex fallback; still meaningful now that Kiro is real,
+        // since those explicit `"kiro"` arms remain the fallback path.
+        assert_eq!(p.name(), "kiro");
+    }
+
+    #[test]
+    fn bare_non_colliding_kiro_model_routes_without_prefix() {
+        let registry = Registry::new(AliasProvider::Codex);
+        let p = registry.provider_for_model("deepseek-3-2", None);
+        assert_eq!(p.expect("provider").name(), "kiro");
     }
 }

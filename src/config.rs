@@ -9,6 +9,7 @@ use crate::paths;
 pub enum AliasProvider {
     Codex,
     Kimi,
+    Kiro,
 }
 
 impl AliasProvider {
@@ -16,6 +17,7 @@ impl AliasProvider {
         match self {
             AliasProvider::Codex => "codex",
             AliasProvider::Kimi => "kimi",
+            AliasProvider::Kiro => "kiro",
         }
     }
 }
@@ -113,6 +115,7 @@ fn parse_alias(raw: &str) -> Option<AliasProvider> {
     match raw {
         "codex" => Some(AliasProvider::Codex),
         "kimi" => Some(AliasProvider::Kimi),
+        "kiro" => Some(AliasProvider::Kiro),
         _ => None,
     }
 }

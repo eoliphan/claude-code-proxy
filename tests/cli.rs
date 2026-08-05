@@ -25,6 +25,7 @@ fn models_prints_all_providers() -> Result<(), Box<dyn std::error::Error>> {
     assert!(out.contains("codex:"));
     assert!(out.contains("kimi:"));
     assert!(out.contains("cursor:"));
+    assert!(out.contains("kiro:"));
 
     let mut cmd = Command::cargo_bin("claude-code-proxy")?;
     cmd.args(["models", "--full"]);
@@ -48,6 +49,7 @@ fn help_describes_visible_commands_and_hides_demo() -> Result<(), Box<dyn std::e
         "Manage Kimi authentication",
         "Manage Cursor authentication",
         "Manage Grok authentication",
+        "Manage Kiro authentication",
     ] {
         assert!(stdout.contains(description), "missing: {description}");
     }
@@ -83,6 +85,7 @@ fn provider_logout_without_auth_is_success() -> Result<(), Box<dyn std::error::E
     let mut cmd = Command::cargo_bin("claude-code-proxy")?;
     cmd.args(["kimi", "auth", "logout"]);
     cmd.env("CCP_CONFIG_DIR", temp.path());
+    cmd.env("HOME", temp.path());
     cmd.assert().success();
     Ok(())
 }
