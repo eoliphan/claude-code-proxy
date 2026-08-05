@@ -27,7 +27,8 @@ use self::client::KiroHttpClient;
 use self::translate::model_allowlist::resolve_model;
 use self::translate::model_discovery::MODEL_CACHE;
 use self::translate::models::{
-    DEFAULT_FIRST_TOKEN_TIMEOUT_MS, KIRO_MODELS, KiroModelMeta, resolve_api_region,
+    DEFAULT_FIRST_TOKEN_TIMEOUT_MS, KIRO_MODELS, KiroModelMeta, is_known_api_region,
+    models_for_region, resolve_api_region,
 };
 use self::translate::stream::{
     KiroStreamError, RunStreamOptions, StreamTimeouts, accumulate_sse_message,
@@ -223,26 +224,41 @@ impl KiroProvider {
             // happens before the first frame — an expired credential or a
             // rejected request, the two likeliest real failures — would
             // otherwise reach the client as a 200 with an empty body.
-            let Some(first) = rx.recv().await else {
-                return match stream_task.await {
-                    Ok(Err(err)) => map_kiro_stream_error_to_response(&err),
-                    Ok(Ok(())) => json_error(
-                        StatusCode::BAD_GATEWAY,
-                        "api_error",
-                        "Kiro completed without producing output",
-                    ),
-                    Err(join_err) => json_error(
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        "api_error",
-                        format!("Kiro stream task join error: {join_err}"),
-                    ),
-                };
+            // A transport error as the *first* item is treated the same as no
+            // item at all, for the same reason: nothing has been committed yet,
+            // so it can still become a real HTTP error instead of a 200 whose
+            // body is a single broken chunk. Unreachable today (`SseEmitter`
+            // only ever sends `Ok`), but this is exactly the bug class the peek
+            // exists to eliminate, so it is closed here rather than assumed.
+            let first = match rx.recv().await {
+                Some(Ok(first)) => first,
+                other => {
+                    let sink_err = match other {
+                        Some(Err(err)) => Some(err),
+                        _ => None,
+                    };
+                    return match (stream_task.await, sink_err) {
+                        (Ok(Err(err)), _) => map_kiro_stream_error_to_response(&err),
+                        (_, Some(err)) => {
+                            json_error(StatusCode::BAD_GATEWAY, "api_error", err.to_string())
+                        }
+                        (Ok(Ok(())), None) => json_error(
+                            StatusCode::BAD_GATEWAY,
+                            "api_error",
+                            "Kiro completed without producing output",
+                        ),
+                        (Err(join_err), None) => json_error(
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            "api_error",
+                            format!("Kiro stream task join error: {join_err}"),
+                        ),
+                    };
+                }
             };
 
             let progress_ctx = ctx.clone();
-            if let Ok(bytes) = &first {
-                record_live_stream_progress(&progress_ctx, bytes);
-            }
+            record_live_stream_progress(&progress_ctx, &first);
+            let first: Result<Bytes, std::io::Error> = Ok(first);
             let rest =
                 futures_util::stream::unfold((rx, progress_ctx), |(mut rx, ctx)| async move {
                     let item = rx.recv().await?;
@@ -305,31 +321,72 @@ fn strip_kiro_prefix(model: &str) -> &str {
     model.strip_prefix(KIRO_PREFIX).unwrap_or(model)
 }
 
-/// `Some(rejection)` if this account cannot use `resolved`, `None` if it can.
-/// Decided entirely locally — no network call, no auth cascade.
+/// `Some(rejection)` if this account demonstrably cannot use `resolved`,
+/// `None` if it can — or if we have no basis to say. Decided entirely
+/// locally: no network call, no auth cascade.
 ///
-/// Availability is decided per **API region**: `contains_id` consults what
-/// `ListAvailableModels` reported for that region and falls back to the
-/// region-filtered static catalog when discovery has not run yet. Checking
-/// `KIRO_MODELS` membership instead would forward, say, a `us-east-1`-only
-/// model upstream from an `eu-central-1` account purely because it exists in
-/// the catalog.
+/// Availability is per **API region**, not per catalog: a `us-east-1`-only
+/// model must not be forwarded upstream from an `eu-central-1` account just
+/// because it exists in `KIRO_MODELS`. But "not in this region's list" is only
+/// a rejection when we actually *have* a list, which makes this three-valued,
+/// not binary:
+///
+/// 1. **Discovery has run for this region** — `ListAvailableModels`' answer is
+///    authoritative in both directions: present → accept, absent → reject.
+/// 2. **No discovery yet, but the region is in the static allowlist table** →
+///    gate against `models_for_region`, the best answer available.
+/// 3. **No discovery yet AND the region is unknown to that table** → do not
+///    gate. We know nothing, and guessing "reject" here is unrecoverable.
+///
+/// Case 3 is not hypothetical, and getting it wrong deadlocks the account:
+/// `resolve_api_region` passes an SSO region that is not in `API_REGION_MAP`
+/// through unchanged (`ca-central-1`, `sa-east-1`, `ap-northeast-2`,
+/// `af-south-1`, `me-*` and the gov regions all qualify), and
+/// `models_for_region` returns an empty list for anything outside its
+/// two-region allowlist. `MODEL_CACHE` is only ever populated by
+/// `refresh_cache_for_credentials`, which fires only from
+/// `KiroAuthManager::adopt` — and `get_auth` returns early without reaching
+/// `adopt` whenever the stored credential is still valid. So a cold process
+/// holding a perfectly good token for such an account would have this gate
+/// reject every model, while the gate itself blocks the only code path that
+/// could ever populate the cache and lift the rejection. Falling through
+/// instead costs at most one upstream error — and on success warms the cache,
+/// so subsequent requests get case 1.
 ///
 /// Shared by both routes on purpose: answering `count_tokens` with a happy
 /// `200` for a model `/v1/messages` rejects with a `400` would tell a client to
 /// budget for a request it can never make.
 fn reject_unavailable_model(rt: &KiroRuntime, raw_model: &str, resolved: &str) -> Option<Response> {
     let api_region = api_region_for(&rt.client.auth_manager().store);
-    if MODEL_CACHE.contains_id(&api_region, resolved) {
+
+    // Case 1: discovery has run — believe it, in both directions.
+    if let Some(discovered) = MODEL_CACHE.get(&api_region) {
+        if discovered.iter().any(|model| model.id == resolved) {
+            return None;
+        }
+        return Some(unavailable_model_error(raw_model, resolved, &api_region));
+    }
+
+    // Case 3: nothing discovered and no static list for this region.
+    if !is_known_api_region(&api_region) {
         return None;
     }
-    Some(json_error(
+
+    // Case 2: nothing discovered, but the static catalog covers this region.
+    if models_for_region(&api_region).contains(&resolved) {
+        return None;
+    }
+    Some(unavailable_model_error(raw_model, resolved, &api_region))
+}
+
+fn unavailable_model_error(raw_model: &str, resolved: &str, api_region: &str) -> Response {
+    json_error(
         StatusCode::BAD_REQUEST,
         "invalid_request_error",
         format!(
             "Model \"{raw_model}\" resolves to \"{resolved}\", which is not available for this Kiro account (API region {api_region})"
         ),
-    ))
+    )
 }
 
 /// Resolved Kiro **API** region for the credential in `store` (not the raw SSO
@@ -630,6 +687,7 @@ mod tests {
         hits: Arc<AtomicUsize>,
         shutdown: Arc<AtomicBool>,
         bodies: Arc<Mutex<Vec<String>>>,
+        finished_writing: Arc<AtomicBool>,
     }
 
     impl Drop for MockKiro {
@@ -646,25 +704,47 @@ mod tests {
         fn request_bodies(&self) -> Vec<String> {
             self.bodies.lock().unwrap().clone()
         }
+
+        /// True once the mock has written every part of its response body.
+        fn finished_writing(&self) -> bool {
+            self.finished_writing.load(Ordering::SeqCst)
+        }
     }
 
+    /// How long a gated body part waits before giving up, so a regression
+    /// surfaces as a failed assertion rather than a hung suite.
+    const GATE_TIMEOUT: Duration = Duration::from_secs(3);
+
     /// Answers every `GenerateAssistantResponse` call with the same scripted
-    /// status + body. Deliberately simpler than `stream.rs`'s own mock (no
-    /// per-chunk delays or gates) — this task tests provider-level branching,
-    /// not stream orchestration.
+    /// status + body, written in one shot.
     fn spawn_mock(status: u16, body: &'static str) -> MockKiro {
+        spawn_mock_parts(status, vec![(false, body)], None)
+    }
+
+    /// As [`spawn_mock`], but the body is written in parts, and a part marked
+    /// `gated` is withheld until the test flips `gate`. This is what makes
+    /// incremental delivery observable: the upstream physically cannot finish
+    /// its response until the test has already received earlier bytes.
+    fn spawn_mock_parts(
+        status: u16,
+        parts: Vec<(bool, &'static str)>,
+        gate: Option<Arc<AtomicBool>>,
+    ) -> MockKiro {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
         let addr = listener.local_addr().unwrap();
         listener.set_nonblocking(true).expect("set nonblocking");
         let url = format!("http://{addr}");
 
+        let gate = gate.clone();
         let hits = Arc::new(AtomicUsize::new(0));
         let shutdown = Arc::new(AtomicBool::new(false));
         let bodies: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
-        let (thread_hits, thread_shutdown, thread_bodies) = (
+        let finished_writing = Arc::new(AtomicBool::new(false));
+        let (thread_hits, thread_shutdown, thread_bodies, thread_finished) = (
             Arc::clone(&hits),
             Arc::clone(&shutdown),
             Arc::clone(&bodies),
+            Arc::clone(&finished_writing),
         );
         let (ready_tx, ready_rx) = std::sync::mpsc::channel();
 
@@ -684,12 +764,29 @@ mod tests {
                             thread_bodies.lock().unwrap().push(request_body.to_string());
                         }
                         let reason = if status == 200 { "OK" } else { "Bad Request" };
-                        let response = format!(
-                            "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                            body.len()
+                        let total: usize = parts.iter().map(|(_, body)| body.len()).sum();
+                        let header = format!(
+                            "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {total}\r\nConnection: close\r\n\r\n"
                         );
-                        let _ = stream.write_all(response.as_bytes());
+                        if stream.write_all(header.as_bytes()).is_err() {
+                            continue;
+                        }
                         let _ = stream.flush();
+                        for (gated, body) in &parts {
+                            if *gated {
+                                let deadline = std::time::Instant::now() + GATE_TIMEOUT;
+                                while std::time::Instant::now() < deadline
+                                    && !gate.as_ref().is_some_and(|g| g.load(Ordering::SeqCst))
+                                {
+                                    std::thread::sleep(Duration::from_millis(5));
+                                }
+                            }
+                            if stream.write_all(body.as_bytes()).is_err() {
+                                break;
+                            }
+                            let _ = stream.flush();
+                        }
+                        thread_finished.store(true, Ordering::SeqCst);
                     }
                     Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                         std::thread::sleep(Duration::from_millis(5));
@@ -707,6 +804,7 @@ mod tests {
             hits,
             shutdown,
             bodies,
+            finished_writing,
         }
     }
 
@@ -820,11 +918,102 @@ mod tests {
 
     #[tokio::test]
     async fn a_model_absent_from_this_regions_catalog_is_rejected() {
-        // `resolve_api_region` passes an unmapped region through unchanged and
-        // `models_for_region` reports no models for it, so nothing is
-        // available to this account — including catalog models.
+        // Case 2: no discovery yet, but `eu-central-1` *is* in the static
+        // allowlist table, and `deepseek-3-2` is one of the models excluded
+        // from it. `eu-west-1` is an SSO region that maps to `eu-central-1`.
         let server = spawn_mock(200, HELLO_BODY);
-        let (client, _tmp) = leaked_test_client("zz-kiro-provider-empty-region");
+        let (client, _tmp) = leaked_test_client("eu-west-1");
+
+        let response = KiroProvider::new()
+            .handle_messages_with(
+                request("deepseek-3-2", false),
+                ctx(),
+                test_runtime(client, &server.url),
+            )
+            .await;
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(server.hits(), 0, "no request may reach the backend");
+    }
+
+    #[tokio::test]
+    async fn a_model_present_in_this_regions_catalog_is_accepted() {
+        // Same region, a model `eu-central-1` is *not* excluded from.
+        let server = spawn_mock(200, HELLO_BODY);
+        let (client, _tmp) = leaked_test_client("eu-west-1");
+
+        let response = KiroProvider::new()
+            .handle_messages_with(
+                request("claude-sonnet-4-6", false),
+                ctx(),
+                test_runtime(client, &server.url),
+            )
+            .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(server.hits(), 1);
+    }
+
+    #[tokio::test]
+    async fn an_unmapped_region_without_discovery_is_not_gated_locally() {
+        // Case 3, the cold-start deadlock guard. Any region absent from
+        // `API_REGION_MAP` is passed through unchanged by `resolve_api_region`
+        // and unknown to `models_for_region`. Gating on that empty list would
+        // 400 every model — and because `MODEL_CACHE` is only populated via
+        // `KiroAuthManager::adopt`, which this gate runs before and which
+        // `get_auth` skips entirely while the stored token is valid, nothing
+        // could ever lift the rejection. The request must reach the backend.
+        //
+        // Real AWS regions in this position (`ca-central-1`, `sa-east-1`,
+        // `ap-northeast-2`, `af-south-1`, `me-*`, `us-gov-*`) are what makes
+        // this matter in production; that they are genuinely absent from the
+        // map is asserted by `models::is_known_api_region_agrees_with_models_for_region`.
+        // A `zz-`-prefixed key exercises the identical code path here while
+        // keeping the precondition below independent of the process-global
+        // `MODEL_CACHE`, which every other test in this module also avoids
+        // colliding with.
+        let region = "zz-kiro-provider-unmapped-region";
+        assert!(
+            MODEL_CACHE.get(region).is_none(),
+            "precondition: no discovery has run for this region"
+        );
+        let server = spawn_mock(200, HELLO_BODY);
+        let (client, _tmp) = leaked_test_client(region);
+
+        let response = KiroProvider::new()
+            .handle_messages_with(
+                request("claude-sonnet-4-6", false),
+                ctx(),
+                test_runtime(client, &server.url),
+            )
+            .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            server.hits(),
+            1,
+            "an unmapped region must not be locally gated"
+        );
+    }
+
+    #[tokio::test]
+    async fn discovery_that_reports_no_such_model_is_still_authoritative() {
+        // Case 1, the rejecting direction: once `ListAvailableModels` has
+        // answered for a region, "absent" is a real answer, not an unknown.
+        let region = "zz-kiro-provider-authoritative-region";
+        MODEL_CACHE.set(
+            region,
+            vec![DiscoveredModel {
+                id: "zz-only-this-one".to_string(),
+                name: "Only This One".to_string(),
+                reasoning: false,
+                input_image: false,
+                context_window: 200_000,
+                max_tokens: 64_000,
+            }],
+        );
+        let server = spawn_mock(200, HELLO_BODY);
+        let (client, _tmp) = leaked_test_client(region);
 
         let response = KiroProvider::new()
             .handle_messages_with(
@@ -890,6 +1079,65 @@ mod tests {
         assert!(sse.contains("event: message_start"), "{sse}");
         assert!(sse.contains("event: message_stop"), "{sse}");
         assert!(sse.contains("Hello"), "{sse}");
+    }
+
+    #[tokio::test]
+    async fn stream_true_delivers_frames_before_the_upstream_finishes() {
+        // Deterministic, not timing-based: the mock physically cannot finish
+        // writing its response until this test has already pulled a body frame
+        // out of the response, because the tail is withheld until the gate is
+        // released. A provider that buffered the whole stream before
+        // responding would produce no frame, never release the gate, and fail
+        // on the timeout below rather than hanging.
+        //
+        // `stream_true_returns_incremental_sse` collects the whole body and so
+        // cannot tell buffered from incremental; this test is what actually
+        // pins the behavior.
+        let release = Arc::new(AtomicBool::new(false));
+        let server = spawn_mock_parts(
+            200,
+            vec![
+                (false, r#"{"content":"Hello"}"#),
+                (true, r#"{"content":" world"}{"contextUsagePercentage":5}"#),
+            ],
+            Some(Arc::clone(&release)),
+        );
+        let (client, _tmp) = leaked_test_client("us-east-1");
+
+        let response = KiroProvider::new()
+            .handle_messages_with(
+                request("claude-sonnet-4-6", true),
+                ctx(),
+                test_runtime(client, &server.url),
+            )
+            .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(content_type(&response), "text/event-stream");
+
+        let mut body = response.into_body();
+        let mut early = Vec::new();
+        // Pull frames until the first delta lands — all of this happens while
+        // the upstream is still blocked on the gate.
+        while !String::from_utf8_lossy(&early).contains("Hello") {
+            let frame = tokio::time::timeout(Duration::from_secs(2), body.frame())
+                .await
+                .expect("frames must arrive before the upstream finishes writing")
+                .expect("stream must not end early")
+                .expect("frame is readable");
+            if let Some(chunk) = frame.data_ref() {
+                early.extend_from_slice(chunk);
+            }
+        }
+        assert!(
+            !server.finished_writing(),
+            "the upstream must still be mid-response when the first frames arrive"
+        );
+
+        release.store(true, Ordering::SeqCst);
+        let rest = body.collect().await.expect("rest of body").to_bytes();
+        let full = String::from_utf8([early, rest.to_vec()].concat()).unwrap();
+        assert!(full.contains("event: message_stop"), "{full}");
+        assert!(full.contains("world"), "{full}");
     }
 
     #[tokio::test]

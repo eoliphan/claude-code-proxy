@@ -295,6 +295,26 @@ pub fn first_token_timeout_for(model_id: &str) -> u64 {
 /// [`resolve_api_region`] passes genuinely unmapped SSO regions through
 /// unchanged, so an unmapped region correctly yields no models here rather
 /// than the full catalog.
+/// The API regions [`models_for_region`] actually has an allowlist for.
+///
+/// Exists to distinguish [`models_for_region`]'s two very different empty
+/// results: "this region is known and genuinely has no models" (impossible
+/// today — both known regions have non-empty lists, and
+/// `is_known_api_region_agrees_with_models_for_region` guards that) versus
+/// "this region is not in the table at all, so we know nothing about it".
+///
+/// That distinction does not matter for *listing* models, which is what
+/// `models_for_region` was written for — an empty list is the right answer
+/// either way. It matters a great deal for *admission control*: see
+/// `providers::kiro::reject_unavailable_model`, where treating an unknown
+/// region's empty list as "reject everything" would lock the account out of
+/// the proxy entirely.
+pub fn is_known_api_region(api_region: &str) -> bool {
+    KNOWN_API_REGIONS.contains(&api_region)
+}
+
+const KNOWN_API_REGIONS: &[&str] = &["us-east-1", "eu-central-1"];
+
 pub fn models_for_region(api_region: &str) -> Vec<&'static str> {
     const EU_CENTRAL_1_EXCLUDED: &[&str] = &[
         "deepseek-3-2",
@@ -355,6 +375,36 @@ pub fn approx_token_count(text: &str) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn is_known_api_region_agrees_with_models_for_region() {
+        // Drift guard: `is_known_api_region` and `models_for_region` keep two
+        // separate lists of the same regions, and callers rely on
+        // "known region" implying "non-empty allowlist".
+        for region in KNOWN_API_REGIONS {
+            assert!(is_known_api_region(region));
+            assert!(
+                !models_for_region(region).is_empty(),
+                "{region} is known, so it must have models"
+            );
+        }
+        // Real AWS SSO regions absent from `API_REGION_MAP`, which
+        // `resolve_api_region` therefore passes through unchanged.
+        for region in [
+            "ca-central-1",
+            "sa-east-1",
+            "ap-northeast-2",
+            "af-south-1",
+            "me-south-1",
+            "us-gov-west-1",
+        ] {
+            assert!(
+                !is_known_api_region(region),
+                "{region} is not in the allowlist table"
+            );
+            assert!(models_for_region(region).is_empty());
+        }
+    }
 
     #[test]
     fn dash_to_dot_converts_version_numbers_only() {
