@@ -10,7 +10,7 @@ claude-code-proxy exposes an Anthropic-compatible HTTP surface to Claude Code an
   <div class="route-arrow" aria-hidden="true">→</div>
   <div class="route-node"><strong>Proxy pipeline</strong><span>route model<br/>refresh auth<br/>translate events</span></div>
   <div class="route-arrow" aria-hidden="true">→</div>
-  <div class="route-node provider-stack"><code>Codex Responses</code><code>Kimi Chat Completions</code><code>Grok Responses</code><code>Cursor Connect</code></div>
+  <div class="route-node provider-stack"><code>Codex Responses</code><code>Kimi Chat Completions</code><code>Grok Responses</code><code>Cursor Connect</code><code>Kiro Q Streaming</code></div>
 </div>
 
 ## Request lifecycle
@@ -25,11 +25,11 @@ claude-code-proxy exposes an Anthropic-compatible HTTP surface to Claude Code an
 
 ## Authentication boundary
 
-Each provider login belongs to claude-code-proxy. The proxy does not read native Codex, Grok, or Cursor Agent credentials. Credentials live in the platform credential store described in [Files and storage](/reference/files-and-storage/). Incoming `ANTHROPIC_AUTH_TOKEN` values are accepted for client compatibility and are not used as upstream credentials.
+Each provider login belongs to claude-code-proxy. The proxy does not read native Codex, Grok, or Cursor Agent credentials. Kiro is the exception: it can adopt an existing Kiro IDE or kiro-cli login before falling back to its own device-code flow. Credentials live in the platform credential store described in [Files and storage](/reference/files-and-storage/). Incoming `ANTHROPIC_AUTH_TOKEN` values are accepted for client compatibility and are not used as upstream credentials.
 
 ## Routing boundary
 
-Routing happens per request, not per server process. Codex IDs, Kimi IDs, Grok IDs, Cursor prefixes, and configured Anthropic-style aliases can share one listener. Unknown model IDs return HTTP 400 with the supported catalog.
+Routing happens per request, not per server process. Codex IDs, Kimi IDs, Grok IDs, Cursor prefixes, Kiro prefixes, and configured Anthropic-style aliases can share one listener. Unknown model IDs return HTTP 400 with the supported catalog.
 
 ## Session state
 

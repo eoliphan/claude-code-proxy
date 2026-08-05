@@ -11,6 +11,7 @@ One `serve` process supports every provider. Choose based on the account you hav
 | [Kimi](/providers/kimi/) | kimi.com with Kimi Code access | OpenAI-style chat completions | `kimi-for-coding` and aliases | Function tools, reasoning, image and video input |
 | [Grok](/providers/grok/) | grok.com | Responses API | `grok-composer-2.5-fast`, `grok-4.5` | Function tools, reasoning, web search, X search, citations |
 | [Cursor Agent](/providers/cursor-agent/) | Cursor account | HTTP/2 Connect stream | Cursor modes and `cursor:<model-id>` prefixes | Dynamic model catalog, effort variants, images, plan and ask modes, session continuation |
+| [Kiro](/providers/kiro/) | AWS IAM Identity Center or Builder ID | AWS CodeWhisperer/Q streaming | Registered catalog, `kiro:<model-id>` prefixes | Real Claude tiers plus DeepSeek/Kimi/MiniMax/GLM/Qwen, credential reuse from Kiro IDE or kiro-cli, thinking |
 
 ## Practical guidance
 
@@ -18,6 +19,8 @@ One `serve` process supports every provider. Choose based on the account you hav
 - Choose **Kimi** for the Kimi Code model and multimodal coding input.
 - Choose **Grok** for Grok models and hosted web or X search.
 - Choose **Cursor Agent** when you want Cursor's model catalog and agent modes. It depends on an installed Cursor Agent bundle for protobuf schemas.
+- Choose **Kiro** for an AWS-billed subscription with access to real Claude
+  tiers, or if you already have a Kiro IDE or kiro-cli login to reuse.
 
 ## Shared behavior
 

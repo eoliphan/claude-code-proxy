@@ -60,6 +60,7 @@ claude-code-proxy <provider> auth <action>
 | `kimi` | Device code | Unsupported | User, expiry, scope, storage | Delete proxy credential |
 | `grok` | Browser PKCE | Device code | Expiry and storage | Delete proxy credential |
 | `cursor` | Browser polling flow | Unsupported | Source, claims, expiry | Delete proxy credential |
+| `kiro` | IDC/Builder ID device code, or reuse of an existing Kiro IDE/kiro-cli login | Same as `login` | Account, region, storage | Delete proxy credential |
 
 Examples:
 
@@ -68,6 +69,7 @@ claude-code-proxy codex auth login
 claude-code-proxy grok auth device
 claude-code-proxy kimi auth status
 claude-code-proxy cursor auth logout
+claude-code-proxy kiro auth login
 ```
 
 A missing credential makes `auth status` exit with status 1. Other provider command failures exit with status 2. Successful commands exit with status 0.

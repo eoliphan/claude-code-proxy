@@ -70,6 +70,7 @@ With the base URL already pointing to the proxy:
 /model kimi-for-coding[1m]
 /model grok-4.5
 /model cursor:gpt-5.5
+/model kiro:claude-sonnet-4-6
 ```
 
 The provider changes with the model. Provider auth must already exist. Claude Code preserves one conversation, while provider-specific in-memory continuation can reset when the provider or model changes.

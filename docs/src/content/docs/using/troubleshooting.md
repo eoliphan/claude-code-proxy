@@ -22,6 +22,7 @@ claude-code-proxy codex auth status
 claude-code-proxy kimi auth status
 claude-code-proxy grok auth status
 claude-code-proxy cursor auth status
+claude-code-proxy kiro auth status
 ```
 
 Use that provider's login command when credentials are missing or expired. Codex requires ChatGPT subscription auth, not an OpenAI API key. Each provider uses proxy-owned credentials.
@@ -84,6 +85,8 @@ CCP_CURSOR_AGENT_BUNDLE=/path/to/cursor-agent/index.js \
 ## Rate limited
 
 Upstream limits are shared with other clients on the same account. Codex limit responses and Kimi HTTP 429 responses surface as HTTP 429 with `retry-after`. Wait for the indicated interval or reduce concurrent traffic.
+
+Kiro's capacity errors (`INSUFFICIENT_MODEL_CAPACITY`) are retried automatically with their own backoff budget. A `MONTHLY_REQUEST_COUNT` error means the account's quota is exhausted for the period and is not retried.
 
 ## Find the complete error
 

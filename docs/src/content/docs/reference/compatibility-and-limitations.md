@@ -9,7 +9,7 @@ claude-code-proxy targets Claude Code's practical Anthropic API usage rather tha
 
 - Provider subscriptions, allowed models, regions, quotas, and enforcement remain under each provider's control.
 - OpenAI has publicly welcomed using Codex through other coding harnesses, but public statements do not guarantee future policy or account treatment.
-- Kimi, Grok, and Cursor use unofficial client integrations. Review the terms and account risk for your use.
+- Kimi, Grok, Cursor, and Kiro use unofficial client integrations. Review the terms and account risk for your use.
 - Upstream rate limits are shared with other clients on the same account.
 
 ## Listener security
@@ -33,7 +33,7 @@ claude-code-proxy targets Claude Code's practical Anthropic API usage rather tha
 
 - Local registration does not guarantee account access to a model.
 - Unknown model IDs have no implicit provider fallback.
-- Anthropic-style aliases route only to the configured Codex or Kimi alias provider.
+- Anthropic-style aliases route only to the configured `aliasProvider` (Codex, Kimi, or Kiro).
 - `[1m]` is a Claude Code client hint and does not change upstream context.
 - Provider context limits can be lower than Claude Code's local threshold.
 - Switching provider or model can clear provider-specific continuation assumptions while Claude Code retains portable history.
@@ -69,6 +69,13 @@ claude-code-proxy targets Claude Code's practical Anthropic API usage rather tha
 - Cursor workspace callbacks and arbitrary native tool forms do not have a general Claude tool bridge.
 - Conversation and pending tool state are in memory. Restarts clear them.
 - Cursor count-tokens uses a rough rendered-prompt estimate.
+
+## Kiro
+
+- Kiro is the only provider that reuses credentials from outside the proxy: an existing Kiro IDE or kiro-cli login, before falling back to its own device-code flow.
+- Native Google/GitHub social login is not implemented; credential reuse can pick up and refresh tokens from a prior kiro-cli social login, but the proxy cannot initiate that login itself.
+- `INSUFFICIENT_MODEL_CAPACITY` is retried with a dedicated backoff budget; `MONTHLY_REQUEST_COUNT` is not retried.
+- Count-tokens is a local heuristic estimate. Kiro's API reports only `contextUsagePercentage`, not exact token counts.
 
 ## Diagnostics and privacy
 

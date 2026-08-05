@@ -37,7 +37,7 @@ Accepts the same basic Anthropic request shape and returns:
 {"input_tokens":1234}
 ```
 
-Codex, Kimi, and Grok use a local `gpt-tokenizer` estimate with `o200k_base`. Cursor estimates the rendered prompt from its character length. Counts support Claude Code compaction behavior and are estimates rather than provider billing values.
+Codex, Kimi, and Grok use a local `gpt-tokenizer` estimate with `o200k_base`. Cursor estimates the rendered prompt from its character length. Kiro uses its own local heuristic estimate, because its API reports only `contextUsagePercentage`, not exact counts. Counts support Claude Code compaction behavior and are estimates rather than provider billing values.
 
 ## `GET /v1/models`
 

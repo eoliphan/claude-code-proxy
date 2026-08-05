@@ -3,6 +3,16 @@ title: Changelog
 description: Release notes for claude-code-proxy.
 ---
 
+## Unreleased
+
+- Kiro (AWS CodeWhisperer/Q) joins Codex, Kimi, Grok, and Cursor Agent as a
+  supported provider. Sign in with an AWS IAM Identity Center or Builder ID
+  account, or reuse an existing Kiro IDE or kiro-cli login. Serves real
+  Claude Sonnet/Opus/Haiku tiers alongside DeepSeek, Kimi, MiniMax, GLM, and
+  Qwen models, selectable via the `kiro:` prefix or as the configured
+  `aliasProvider`. `claude-code-proxy kiro auth login/device/status/logout`
+  manages credentials.
+
 ## v0.1.28 (2026-07-29)
 
 - OpenAI-compatible clients can generate and edit images with `gpt-image-2`

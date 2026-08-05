@@ -28,15 +28,24 @@ On macOS, Codex and Cursor use Keychain services:
 - `claude-code-proxy.codex`
 - `claude-code-proxy.cursor`
 
-Kimi and Grok use `<configuration-root>/<provider>/auth.json` on every platform. Codex and Cursor use the same file layout on Linux and Windows. File-backed credentials are written with restrictive permissions where supported.
+Kimi, Grok, and Kiro use `<configuration-root>/<provider>/auth.json` on every platform. Codex and Cursor use the same file layout on Linux and Windows. File-backed credentials are written with restrictive permissions where supported.
 
 When `CCP_CONFIG_DIR` is set, every provider uses `<CCP_CONFIG_DIR>/<provider>/auth.json`, including Codex and Cursor on macOS. `CCP_CURSOR_AUTH_TOKEN` bypasses Cursor's local credential store for that process.
 
-The proxy owns these credentials independently of native Codex, Grok, and Cursor Agent stores.
+The proxy owns these credentials independently of native Codex, Grok, and Cursor Agent stores. Kiro is the exception: alongside its own `<configuration-root>/kiro/auth.json`, it can read (and, on refresh, write back to) external Kiro credential sources — see below.
 
 ## Kimi device ID
 
 Kimi stores a persistent UUID at `<configuration-root>/kimi/device_id` for file-backed setups. It is bound into the Kimi token and must remain paired with that login.
+
+## Kiro external credential sources
+
+Beyond its own `<configuration-root>/kiro/auth.json`, Kiro can adopt credentials from two sources it does not own:
+
+- The Kiro IDE's token cache at `~/.aws/sso/cache/kiro-auth-token.json`, plus a companion client-registration file in the same directory.
+- kiro-cli's local SQLite credential store, read via the `auth_kv` table.
+
+Both are read-only inputs except where a token refresh needs to write updated tokens back into kiro-cli's database to keep it in sync. Home-directory resolution follows the same `HOME`/`USERPROFILE` lookup as the rest of the proxy.
 
 ## Structured log
 

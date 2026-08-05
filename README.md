@@ -1,7 +1,7 @@
 # claude-code-proxy
 
-Claude Code, powered by **OpenAI Codex**, **Kimi**, **Grok**, or **Cursor
-Agent**.
+Claude Code, powered by **OpenAI Codex**, **Kimi**, **Grok**, **Cursor
+Agent**, or **Kiro**.
 
 Docs: <https://claude-code-proxy.raine.dev>
 
@@ -85,6 +85,7 @@ The opt-in Images API returns base64 image data and consumes the signed-in accou
 | Kimi         | kimi.com with Kimi Code access | `kimi-for-coding` and aliases                   |
 | Grok         | grok.com                       | Registered Grok models                          |
 | Cursor Agent | Cursor account                 | Cursor aliases and `cursor:<model-id>` prefixes |
+| Kiro         | AWS IAM Identity Center or Builder ID | Claude/DeepSeek/Kimi/MiniMax/GLM/Qwen tiers and `kiro:<model-id>` prefixes |
 
 Run `claude-code-proxy models` for the current catalog or
 `claude-code-proxy models --full` for every dynamic Cursor alias.
