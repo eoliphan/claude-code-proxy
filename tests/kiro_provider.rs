@@ -62,6 +62,20 @@
 //! in-process (non-`assert_cmd`) call, so this race can't change any
 //! assertion's outcome. `assert_cmd`-based CLI tests are unaffected: each
 //! spawns a brand new OS process with its own fresh `KIRO_HTTP_CLIENT`.
+//!
+//! A third hazard, specific to the `assert_cmd` CLI tests, is not
+//! process-global but is real and was caught in review: `FileAuthStore`'s
+//! *legacy* file path (`paths::provider_legacy_auth_file`) is derived from
+//! `legacy_config_dir`, which reads `HOME` directly and ignores
+//! `CCP_CONFIG_DIR` entirely. `load()` falls back to that legacy path
+//! whenever the primary path has nothing, and -- more seriously --
+//! `clear()` (unlike `load()`) has no `self.file == self.legacy_file`
+//! short-circuit, so it unconditionally removes *both* paths. A `kiro auth
+//! logout` CLI test that sets only `CCP_CONFIG_DIR` would therefore delete
+//! a real `$HOME/.config/claude-code-proxy/kiro/auth.json` if one exists on
+//! the machine running the tests. Every CLI test below sets both
+//! `CCP_CONFIG_DIR` and `HOME`, matching `tests/codex_auth.rs::codex_cmd()`'s
+//! existing convention (which sets both for this exact reason).
 
 use assert_cmd::Command;
 use axum::body::Body;
@@ -233,15 +247,39 @@ async fn kiro_unknown_model_is_rejected_locally_through_the_http_surface() {
     );
 }
 
-/// `/v1/models` is served from `Registry::all_supported_models()`, a static,
-/// region-blind, pre-auth snapshot (see Task 17's review notes) -- it never
-/// touches `MODEL_CACHE`/the auth store, so this needs no env isolation.
-/// `deepseek-3-2` is a real Kiro-only model id used elsewhere in this
-/// codebase's own registry tests as a bare (unprefixed) id that still
-/// routes to kiro without colliding with any alias.
+/// `/v1/models` is served by `handler_models` (`src/server.rs`), which calls
+/// *only* `Registry::all_supported_models()` -> `supported_models_for()`,
+/// reading the static per-provider model map `Registry::new()` builds once
+/// from `KIRO_MODELS` -- region-blind and pre-auth. It never calls the
+/// `Provider::supported_models()` *trait* method (the one that reads
+/// `api_region_for`/`MODEL_CACHE`): verified with `rg -n
+/// '\.supported_models\(\)' src/` -- every non-test call site is inside a
+/// `#[cfg(test)]` module, so that method has zero production callers for
+/// any provider, Kiro included. `deepseek-3-2` is excluded from
+/// `models_for_region("eu-central-1")` (the region-filtered list
+/// `Provider::supported_models()` would use) but is *not* filtered out of
+/// the raw `KIRO_MODELS` catalog `/v1/models` actually reads, so this
+/// assertion holds regardless of what region an ambient credential
+/// resolves to.
+///
+/// This test still takes `env_lock()` and isolates `CCP_CONFIG_DIR`/`HOME`
+/// and builds the registry via `Registry::new(AliasProvider::Codex)`
+/// (skipping `with_default_alias()`'s `config::alias_provider()`, which
+/// does read ambient env/config-file state) -- not because this route
+/// touches `MODEL_CACHE`/the auth store, but for structural consistency
+/// with every other in-process test in this file: no test here runs
+/// without the same discipline, so nothing has to be re-litigated per test
+/// to confirm it's safe to run concurrently with siblings that mutate
+/// process env via `EnvGuard`.
+#[allow(clippy::await_holding_lock)]
 #[tokio::test]
 async fn models_endpoint_lists_a_kiro_model() {
-    let app = claude_code_proxy::server::app(Arc::new(Registry::with_default_alias()));
+    let _guard = env_lock();
+    let config = TempDir::new().unwrap();
+    let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
+    let _home_env = EnvGuard::set("HOME", config.path());
+
+    let app = claude_code_proxy::server::app(Arc::new(Registry::new(AliasProvider::Codex)));
     let response = app
         .oneshot(
             Request::builder()
@@ -290,9 +328,24 @@ fn kiro_credentials_fixture() -> Value {
 
 /// Exercises the binary-level `kiro auth status`/`kiro auth logout` CLI
 /// surface (not `CliHandlers` called in isolation) across the full
-/// pre-login -> fixture-seeded -> post-logout lifecycle, matching
-/// `tests/cli.rs::kimi_auth_status_reads_stored_auth`'s established
-/// convention for isolating credential state via `CCP_CONFIG_DIR`.
+/// pre-login -> fixture-seeded -> post-logout lifecycle.
+///
+/// Sets **both** `CCP_CONFIG_DIR` and `HOME`, not `CCP_CONFIG_DIR` alone:
+/// `FileAuthStore`'s *legacy* path (`paths::provider_legacy_auth_file`) is
+/// derived from `legacy_config_dir`, which reads `HOME` directly and
+/// ignores `CCP_CONFIG_DIR` entirely. `FileAuthStore::load()` falls back to
+/// that legacy path whenever the primary path has nothing -- which is
+/// always true here except in the "after fixture" step -- so without a
+/// `HOME` override, the pre-login and post-logout assertions below would
+/// read whatever legacy credential happens to already exist on the
+/// machine, and would spuriously fail on any developer box that has one.
+/// Worse: `FileAuthStore::clear()` (unlike `load()`) has **no**
+/// `self.file == self.legacy_file` short-circuit -- it unconditionally
+/// removes both paths -- so `kiro auth logout` without the `HOME` override
+/// would delete a real `$HOME/.config/claude-code-proxy/kiro/auth.json` if
+/// one exists. Matches the convention already established for this exact
+/// reason in `tests/codex_auth.rs`'s `codex_cmd()` helper, which sets both
+/// for the same documented reason.
 #[test]
 fn kiro_auth_cli_lifecycle_status_and_logout() -> Result<(), Box<dyn std::error::Error>> {
     let temp = TempDir::new()?;
@@ -303,6 +356,7 @@ fn kiro_auth_cli_lifecycle_status_and_logout() -> Result<(), Box<dyn std::error:
     let mut status_before = Command::cargo_bin("claude-code-proxy")?;
     status_before.args(["kiro", "auth", "status"]);
     status_before.env("CCP_CONFIG_DIR", temp.path());
+    status_before.env("HOME", temp.path());
     status_before
         .assert()
         .failure()
@@ -321,6 +375,7 @@ fn kiro_auth_cli_lifecycle_status_and_logout() -> Result<(), Box<dyn std::error:
     let mut status_after = Command::cargo_bin("claude-code-proxy")?;
     status_after.args(["kiro", "auth", "status"]);
     status_after.env("CCP_CONFIG_DIR", temp.path());
+    status_after.env("HOME", temp.path());
     status_after
         .assert()
         .success()
@@ -331,12 +386,14 @@ fn kiro_auth_cli_lifecycle_status_and_logout() -> Result<(), Box<dyn std::error:
     let mut logout = Command::cargo_bin("claude-code-proxy")?;
     logout.args(["kiro", "auth", "logout"]);
     logout.env("CCP_CONFIG_DIR", temp.path());
+    logout.env("HOME", temp.path());
     logout.assert().success().stdout(contains("Logged out"));
 
     // After logout the credential file is gone, so status must fail again.
     let mut status_final = Command::cargo_bin("claude-code-proxy")?;
     status_final.args(["kiro", "auth", "status"]);
     status_final.env("CCP_CONFIG_DIR", temp.path());
+    status_final.env("HOME", temp.path());
     status_final
         .assert()
         .failure()
@@ -348,13 +405,17 @@ fn kiro_auth_cli_lifecycle_status_and_logout() -> Result<(), Box<dyn std::error:
 
 /// `kiro auth logout` with nothing stored must still succeed (mirrors
 /// `tests/cli.rs::provider_logout_without_auth_is_success`, which covers
-/// this for kimi).
+/// this for kimi). Sets `HOME` alongside `CCP_CONFIG_DIR` for the same
+/// reason documented on `kiro_auth_cli_lifecycle_status_and_logout` above:
+/// `clear()` unconditionally removes the legacy path too, and that path is
+/// derived from `HOME`, not `CCP_CONFIG_DIR`.
 #[test]
 fn kiro_auth_logout_without_prior_login_is_success() -> Result<(), Box<dyn std::error::Error>> {
     let temp = TempDir::new()?;
     let mut cmd = Command::cargo_bin("claude-code-proxy")?;
     cmd.args(["kiro", "auth", "logout"]);
     cmd.env("CCP_CONFIG_DIR", temp.path());
+    cmd.env("HOME", temp.path());
     cmd.assert().success();
     Ok(())
 }
@@ -451,8 +512,9 @@ async fn alias_collision_black_box_kiro_prefix_wins_bare_id_stays_on_alias_provi
 }
 
 /// Same collision, with kiro itself configured as the alias provider: the
-/// bare id must now resolve to kiro too, and the prefixed id must agree.
-/// This is the mirror image of Task 8's
+/// bare id must now resolve to kiro too (the `kiro:`-prefixed case is
+/// already covered, for both alias-provider configurations, by the test
+/// above). This is the mirror image of Task 8's
 /// `registry.rs::kiro_as_alias_provider_routes_bare_aliases_to_kiro` unit
 /// test, again proven through the real HTTP surface rather than
 /// `provider_for_model` directly.
