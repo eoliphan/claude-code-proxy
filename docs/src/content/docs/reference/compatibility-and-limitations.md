@@ -26,8 +26,17 @@ claude-code-proxy targets Claude Code's practical Anthropic API usage rather tha
 - Token counts are local estimates, not exact upstream tokenizer or billing counts.
 - Claude Code title generation and other structured background requests are forwarded and consume provider tokens.
 - Anthropic-specific fields without a provider mapping can be dropped.
-- Native OpenAI Responses passthrough is opt-in and limited to registered Codex models and response creation.
+- Native OpenAI Responses passthrough is opt-in and applies to registered Codex models.
 - Codex Images passthrough is separately opt-in, restricted to `gpt-image-2`, and supports generation plus JSON or multipart edits. Variations, masks, remote image URLs, and URL-formatted outputs are unsupported.
+
+## OpenAI API scope
+
+- `CCP_CODEX_RESPONSES_API=1` enables `/v1/chat/completions` and `/v1/responses` for Codex, Kimi, Grok, OpenCode Go, and Cursor models.
+- Codex Responses requests use native passthrough. Requests for the other providers support their mapped subsets of text, reasoning, function tools, tool results, token limits, usage, streaming, aliases, and `[1m]` model hints; exact support depends on the selected provider and model.
+- Unsupported non-null request fields return an error instead of being ignored.
+- Grok search calls appear as Responses `web_search_call` items. Chat Completions returns the citations without a separate search item.
+- Cursor tool bridging supports `Read`, `Write`, and `Bash`. It requires streaming and a stable session ID.
+- Stored Responses operations, WebSocket ingress, multiple choices, audio, log probabilities, and arbitrary hosted tools are unsupported.
 
 ## Models and context
 

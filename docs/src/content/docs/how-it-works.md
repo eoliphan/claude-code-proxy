@@ -3,17 +3,17 @@ title: How it works
 description: Follow authentication, routing, protocol translation, streaming, session state, and diagnostics through claude-code-proxy.
 ---
 
-claude-code-proxy exposes an Anthropic-compatible HTTP surface to Claude Code and translates each request into the selected provider's native protocol.
+claude-code-proxy exposes Anthropic Messages and optional OpenAI-compatible routes. Every route selects a provider from the request model and translates through that provider's native protocol.
 
 <div class="route-rail" aria-label="claude-code-proxy request architecture">
-  <div class="route-node"><strong>Claude Code</strong><span>POST /v1/messages<br/>Anthropic SSE</span></div>
+  <div class="route-node"><strong>API client</strong><span>Anthropic Messages<br/>OpenAI Chat or Responses</span></div>
   <div class="route-arrow" aria-hidden="true">→</div>
   <div class="route-node"><strong>Proxy pipeline</strong><span>route model<br/>refresh auth<br/>translate events</span></div>
   <div class="route-arrow" aria-hidden="true">→</div>
-  <div class="route-node provider-stack"><code>Codex Responses</code><code>Kimi Chat Completions</code><code>Grok Responses</code><code>Cursor Connect</code><code>Kiro Q Streaming</code></div>
+  <div class="route-node provider-stack"><code>Codex Responses</code><code>Kimi Chat Completions</code><code>Grok Responses</code><code>OpenCode Chat / Messages / Responses</code><code>Cursor Connect</code><code>Kiro Q Streaming</code></div>
 </div>
 
-## Request lifecycle
+## Anthropic requests
 
 1. Claude Code sends an Anthropic Messages request to `/v1/messages`.
 2. The registry normalizes a trailing `[1m]`, resolves aliases, and selects a provider from the model ID.
@@ -23,13 +23,19 @@ claude-code-proxy exposes an Anthropic-compatible HTTP surface to Claude Code an
 6. The proxy emits Anthropic SSE events or accumulates a non-streaming Anthropic response.
 7. The monitor, JSONL logger, and optional traffic capture record operational details.
 
+## OpenAI-compatible requests
+
+Enable the OpenAI routes to use `/v1/chat/completions` or `/v1/responses`. The `model` field chooses Codex, Kimi, Grok, OpenCode Go, or Cursor in the same way it does on `/v1/messages`.
+
+Codex Responses requests go directly to the native Codex API. The proxy translates other OpenAI requests to the selected provider and returns either Chat Completions or Responses output. Streaming and non-streaming requests use the same translation rules, and unsupported fields return an error instead of being ignored.
+
 ## Authentication boundary
 
-Each provider login belongs to claude-code-proxy. The proxy does not read native Codex, Grok, or Cursor Agent credentials. Kiro is the exception: it can adopt an existing Kiro IDE or kiro-cli login before falling back to its own device-code flow. Credentials live in the platform credential store described in [Files and storage](/reference/files-and-storage/). Incoming `ANTHROPIC_AUTH_TOKEN` values are accepted for client compatibility and are not used as upstream credentials.
+Each provider login belongs to claude-code-proxy. The proxy does not read native Codex, Grok, or Cursor Agent credentials. Credentials live in the platform credential store described in [Files and storage](/reference/files-and-storage/). OpenCode Go instead uses the configured subscription API key. Kiro is the exception among the OAuth-style providers: it can adopt an existing Kiro IDE or kiro-cli login before falling back to its own device-code flow. Incoming `ANTHROPIC_AUTH_TOKEN` values are accepted for client compatibility and are not used as upstream credentials.
 
 ## Routing boundary
 
-Routing happens per request, not per server process. Codex IDs, Kimi IDs, Grok IDs, Cursor prefixes, Kiro prefixes, and configured Anthropic-style aliases can share one listener. Unknown model IDs return HTTP 400 with the supported catalog.
+Routing happens per request, not per server process or API surface. Codex IDs, Kimi IDs, Grok IDs, OpenCode Go IDs, Cursor prefixes, Kiro prefixes, and configured Anthropic-style aliases can share one listener across `/v1/messages`, `/v1/chat/completions`, and `/v1/responses`. Unknown model IDs return HTTP 400 with the supported catalog.
 
 ## Session state
 
@@ -37,6 +43,6 @@ Claude Code sends `x-claude-code-session-id`. The proxy uses it for monitor grou
 
 ## Count tokens
 
-`POST /v1/messages/count_tokens` performs a local estimate with `gpt-tokenizer` and the `o200k_base` encoding. It supports Claude Code's compaction decisions without an upstream request.
+`POST /v1/messages/count_tokens` stays local and does not make an upstream request. Codex uses `o200k_base` for text plus estimates for images, encrypted reasoning, and protocol framing. Other providers use their own local estimators. The result supports Claude Code's compaction decisions but is not a provider billing count.
 
 See [HTTP API](/reference/http-api/) for route contracts and [Compatibility and limitations](/reference/compatibility-and-limitations/) for translation boundaries.

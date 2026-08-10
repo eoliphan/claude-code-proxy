@@ -22,7 +22,10 @@ use crate::anthropic::{
     schema::{CountTokensResponse, MessagesRequest},
 };
 use crate::monitor::MonitorHandle;
-use crate::provider::{CliHandlers, Provider, RequestContext};
+use crate::provider::{
+    CliHandlers, Generation, GenerationBody, Provider, ProviderError, ProviderErrorKind,
+    RequestContext,
+};
 use crate::{registry::GROK_MODELS, traffic::StreamTrafficCapture};
 
 use self::auth::token_store::file_store;
@@ -186,6 +189,51 @@ impl Provider for GrokProvider {
             }),
         )
             .into_response()
+    }
+
+    async fn generate_anthropic_stream(
+        &self,
+        mut body: MessagesRequest,
+        ctx: RequestContext,
+    ) -> Result<Generation, ProviderError> {
+        body.stream = true;
+        let requested = body.model.clone().unwrap_or_else(|| "grok-4.5".into());
+        let resolved = resolve_model(&requested);
+        assert_allowed_model(&resolved).map_err(|error| {
+            ProviderError::new(
+                StatusCode::BAD_REQUEST,
+                ProviderErrorKind::InvalidRequest,
+                error.to_string(),
+            )
+        })?;
+        let translated = translate_request(&body, resolved.clone()).map_err(|error| {
+            ProviderError::new(
+                StatusCode::BAD_REQUEST,
+                ProviderErrorKind::InvalidRequest,
+                error.to_string(),
+            )
+        })?;
+        if let Some(monitor) = ctx.monitor.as_ref() {
+            monitor.model_resolved(&ctx.req_id, &resolved);
+            monitor.upstream_started(&ctx.req_id);
+        }
+        let upstream = self
+            .client
+            .post(&translated, ctx.traffic.clone())
+            .await
+            .map_err(grok_provider_error)?;
+        let response = stream_response(
+            upstream,
+            format!("msg_{}", uuid::Uuid::new_v4().simple()),
+            requested,
+            ctx.monitor.clone(),
+            ctx.req_id.clone(),
+            ctx.traffic.clone(),
+        );
+        Ok(Generation {
+            body: GenerationBody::LiveSse(response.into_body()),
+            resolved_model: resolved,
+        })
     }
 }
 
@@ -439,6 +487,22 @@ fn write_error(traffic: Option<&crate::traffic::TrafficCapture>, stage: &str, ki
             &serde_json::json!({"stage":stage,"kind":kind}),
         );
     }
+}
+
+fn grok_provider_error(error: client::GrokError) -> ProviderError {
+    let kind = match error.status {
+        StatusCode::UNAUTHORIZED => ProviderErrorKind::Authentication,
+        StatusCode::TOO_MANY_REQUESTS => ProviderErrorKind::RateLimit,
+        StatusCode::PAYMENT_REQUIRED | StatusCode::FORBIDDEN => ProviderErrorKind::Permission,
+        _ => ProviderErrorKind::Api,
+    };
+    let status = match kind {
+        ProviderErrorKind::Api => StatusCode::BAD_GATEWAY,
+        _ => error.status,
+    };
+    let mut mapped = ProviderError::new(status, kind, error.message);
+    mapped.retry_after = error.retry_after;
+    mapped
 }
 
 fn map_error(error: client::GrokError) -> Response {

@@ -2,6 +2,11 @@ use crate::{
     anthropic::json_error,
     logging::{Logger, REDACT_KEYS, create_logger},
     monitor::{EndpointKind, MonitorHandle},
+    openai_compat::{
+        MAX_OPENAI_REQUEST_BYTES, OpenAiError, OpenAiSurface,
+        request::{extract_model, parse_request},
+        stream::openai_response as render_openai_response,
+    },
     project,
     provider::RequestContext,
     providers::codex::{
@@ -14,8 +19,13 @@ use crate::{
         native::{
             CodexNativeBackend, NativeResponseOutcome, openai_error, validate_native_request_model,
         },
+        transcription::{
+            CodexTranscriptionBackend, MAX_TRANSCRIPTION_REQUEST_BYTES, TranscriptionRequestError,
+            prepare_transcription, transcription_error_response,
+        },
     },
     registry::{Registry, normalize_incoming_model},
+    request_identity::{CLAUDE_AGENT_HEADER, CLAUDE_PARENT_AGENT_HEADER, ConversationIdentity},
     session::{self, SessionState},
     traffic::{TrafficCaptureOptions, create_traffic_capture},
 };
@@ -171,6 +181,7 @@ pub fn app(registry: Arc<Registry>) -> Router {
         AppFeatures {
             responses_api: crate::config::codex_responses_api(),
             images_api: crate::config::codex_images_api(),
+            transcriptions_api: crate::config::codex_transcriptions_api(),
         },
     )
 }
@@ -182,6 +193,7 @@ pub fn app_with_monitor(registry: Arc<Registry>, monitor: Option<MonitorHandle>)
         AppFeatures {
             responses_api: crate::config::codex_responses_api(),
             images_api: crate::config::codex_images_api(),
+            transcriptions_api: crate::config::codex_transcriptions_api(),
         },
     )
 }
@@ -190,6 +202,7 @@ pub fn app_with_monitor(registry: Arc<Registry>, monitor: Option<MonitorHandle>)
 pub struct AppFeatures {
     pub responses_api: bool,
     pub images_api: bool,
+    pub transcriptions_api: bool,
 }
 
 pub fn app_with_options(
@@ -203,6 +216,7 @@ pub fn app_with_options(
         AppFeatures {
             responses_api,
             images_api: false,
+            transcriptions_api: false,
         },
     )
 }
@@ -232,12 +246,16 @@ pub fn app_with_features(
     } else {
         None
     };
+    let transcriptions = features
+        .transcriptions_api
+        .then(|| Arc::new(CodexTranscriptionBackend::new()));
     let state = Arc::new(AppState {
         registry,
         monitor,
         native_responses,
         chat_completions,
         images,
+        transcriptions,
     });
     let router = Router::new()
         .route("/healthz", get(healthz))
@@ -261,6 +279,15 @@ pub fn app_with_features(
     } else {
         router
     };
+    let router = if features.transcriptions_api {
+        router.route(
+            "/v1/audio/transcriptions",
+            post(handler_transcription)
+                .layer(DefaultBodyLimit::max(MAX_TRANSCRIPTION_REQUEST_BYTES)),
+        )
+    } else {
+        router
+    };
     router.fallback(fallback_handler).with_state(state)
 }
 
@@ -271,6 +298,7 @@ struct AppState {
     native_responses: Option<Arc<CodexNativeBackend>>,
     chat_completions: Option<Arc<ChatCompletionsBackend>>,
     images: Option<Arc<CodexImagesBackend>>,
+    transcriptions: Option<Arc<CodexTranscriptionBackend>>,
 }
 
 async fn healthz() -> Json<serde_json::Value> {
@@ -298,6 +326,7 @@ async fn handler_models(
         .map(|(model, provider)| {
             json!({
                 "type": "model",
+                "object": "model",
                 "id": model,
                 "display_name": format!("{model} ({provider})"),
             })
@@ -308,6 +337,7 @@ async fn handler_models(
         data.truncate(limit);
     }
     Json(json!({
+        "object": "list",
         "data": data,
         "has_more": has_more,
         "first_id": data.first().and_then(|entry| entry.get("id")).cloned(),
@@ -321,6 +351,218 @@ async fn handler_messages(State(state): State<Arc<AppState>>, req: Request<Body>
 
 async fn handler_count_tokens(State(state): State<Arc<AppState>>, req: Request<Body>) -> Response {
     dispatch_request(state, req, true).await
+}
+
+async fn handler_transcription(State(state): State<Arc<AppState>>, req: Request<Body>) -> Response {
+    let started_at = Instant::now();
+    let log = create_logger("server");
+    let req_id = Uuid::new_v4().to_string();
+    let headers = req.headers().clone();
+    log.info(
+        "request",
+        Some(Map::from_iter([
+            ("reqId".to_string(), json!(&req_id)),
+            ("method".to_string(), json!("POST")),
+            ("path".to_string(), json!("/v1/audio/transcriptions")),
+            ("query".to_string(), json!({})),
+        ])),
+    );
+    let session_id = native_session_id(&headers);
+    if let Some(monitor) = state.monitor.as_ref() {
+        monitor.request_started(
+            &req_id,
+            session_id.clone(),
+            None,
+            EndpointKind::Transcriptions,
+        );
+        monitor.provider_selected(&req_id, "codex", "codex-transcribe", None);
+    }
+    let request_guard = RequestMonitorGuard::new(state.monitor.clone(), req_id.clone());
+    if req.uri().query().is_some() {
+        let response = transcription_error_response(TranscriptionRequestError::invalid(
+            "Transcription endpoint does not accept query parameters",
+            None,
+        ));
+        log_native_request_completed(
+            &log,
+            &req_id,
+            "transcriptions",
+            Some("codex-transcribe"),
+            response.status(),
+            started_at,
+        );
+        return monitor_response_body(response, request_guard);
+    }
+    let content_type = headers
+        .get(http::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if !content_type.starts_with("multipart/form-data") {
+        let response = transcription_error_response(TranscriptionRequestError {
+            status: StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            message: "Transcription request must use multipart/form-data".to_string(),
+            param: None,
+            code: "unsupported_media_type",
+        });
+        log_native_request_completed(
+            &log,
+            &req_id,
+            "transcriptions",
+            Some("codex-transcribe"),
+            response.status(),
+            started_at,
+        );
+        return monitor_response_body(response, request_guard);
+    }
+    let mut multipart = match Multipart::from_request(req, &()).await {
+        Ok(multipart) => multipart,
+        Err(error) => {
+            let status = axum::response::IntoResponse::into_response(error).status();
+            let response = transcription_error_response(TranscriptionRequestError {
+                status: if status == StatusCode::PAYLOAD_TOO_LARGE {
+                    StatusCode::PAYLOAD_TOO_LARGE
+                } else {
+                    StatusCode::BAD_REQUEST
+                },
+                message: if status == StatusCode::PAYLOAD_TOO_LARGE {
+                    "Transcription request exceeded the size limit".to_string()
+                } else {
+                    "Invalid multipart transcription request".to_string()
+                },
+                param: None,
+                code: if status == StatusCode::PAYLOAD_TOO_LARGE {
+                    "request_too_large"
+                } else {
+                    "invalid_multipart"
+                },
+            });
+            log_native_request_completed(
+                &log,
+                &req_id,
+                "transcriptions",
+                Some("codex-transcribe"),
+                response.status(),
+                started_at,
+            );
+            return monitor_response_body(response, request_guard);
+        }
+    };
+    let mut audio = None;
+    let mut filename = None;
+    let mut audio_content_type = None;
+    let mut language = None;
+    while let Some(field) = match multipart.next_field().await {
+        Ok(field) => field,
+        Err(_) => {
+            let response = transcription_error_response(TranscriptionRequestError::invalid(
+                "Invalid multipart transcription request",
+                None,
+            ));
+            return monitor_response_body(response, request_guard);
+        }
+    } {
+        let name = field.name().unwrap_or_default().to_string();
+        match name.as_str() {
+            "file" => {
+                if audio.is_some() {
+                    let response =
+                        transcription_error_response(TranscriptionRequestError::invalid(
+                            "Transcription request must contain one 'file' field",
+                            Some("file"),
+                        ));
+                    return monitor_response_body(response, request_guard);
+                }
+                filename = field.file_name().map(str::to_string);
+                audio_content_type = field.content_type().map(str::to_string);
+                audio = match field.bytes().await {
+                    Ok(bytes) => Some(bytes),
+                    Err(_) => {
+                        let response =
+                            transcription_error_response(TranscriptionRequestError::invalid(
+                                "Failed to read uploaded audio",
+                                Some("file"),
+                            ));
+                        return monitor_response_body(response, request_guard);
+                    }
+                };
+            }
+            "language" => {
+                language = match multipart_text(field, "language").await {
+                    Ok(value) => Some(value),
+                    Err(error) => {
+                        return monitor_response_body(
+                            transcription_error_response(TranscriptionRequestError {
+                                status: error.status,
+                                message: error.message,
+                                param: error.param,
+                                code: error.code.unwrap_or("invalid_multipart"),
+                            }),
+                            request_guard,
+                        );
+                    }
+                };
+            }
+            "model" => {
+                if multipart_text(field, "model").await.is_err() {
+                    let response =
+                        transcription_error_response(TranscriptionRequestError::invalid(
+                            "Invalid multipart 'model' field",
+                            Some("model"),
+                        ));
+                    return monitor_response_body(response, request_guard);
+                }
+            }
+            _ => {
+                let response = transcription_error_response(TranscriptionRequestError::invalid(
+                    format!("Unsupported multipart field '{name}'"),
+                    None,
+                ));
+                return monitor_response_body(response, request_guard);
+            }
+        }
+    }
+    let prepared = match prepare_transcription(audio, filename, audio_content_type, language) {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            let response = transcription_error_response(error);
+            log_native_request_completed(
+                &log,
+                &req_id,
+                "transcriptions",
+                Some("codex-transcribe"),
+                response.status(),
+                started_at,
+            );
+            return monitor_response_body(response, request_guard);
+        }
+    };
+    let context = RequestContext {
+        req_id: req_id.clone(),
+        session_id,
+        session_seq: None,
+        provider: "codex".to_string(),
+        traffic: None,
+        monitor: state.monitor.clone(),
+    };
+    let response = match state.transcriptions.as_ref() {
+        Some(backend) => backend.handle(prepared, context).await,
+        None => transcription_error_response(TranscriptionRequestError {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            message: "Codex transcription API is unavailable".to_string(),
+            param: None,
+            code: "transcriptions_api_unavailable",
+        }),
+    };
+    log_native_request_completed(
+        &log,
+        &req_id,
+        "transcriptions",
+        Some("codex-transcribe"),
+        response.status(),
+        started_at,
+    );
+    monitor_response_body(response, request_guard)
 }
 
 async fn handler_image_generation(
@@ -606,15 +848,15 @@ async fn handler_responses(State(state): State<Arc<AppState>>, req: Request<Body
         monitor.request_started(&req_id, session_id.clone(), None, EndpointKind::Responses);
     }
     let request_guard = RequestMonitorGuard::new(state.monitor.clone(), req_id.clone());
-    let body_bytes = match axum::body::to_bytes(req.into_body(), usize::MAX).await {
+    let body_bytes = match axum::body::to_bytes(req.into_body(), MAX_OPENAI_REQUEST_BYTES).await {
         Ok(bytes) => bytes,
-        Err(error) => {
+        Err(_) => {
             let response = openai_error(
-                StatusCode::BAD_REQUEST,
+                StatusCode::PAYLOAD_TOO_LARGE,
                 "invalid_request_error",
-                format!("Invalid JSON: {error}"),
+                "Request body exceeded the size limit".to_string(),
                 None,
-                Some("invalid_json"),
+                Some("request_too_large"),
             );
             log_native_request_completed(
                 &log,
@@ -641,54 +883,80 @@ async fn handler_responses(State(state): State<Arc<AppState>>, req: Request<Body
             return monitor_response_body(response, request_guard);
         }
     };
-    if let Err(response) = validate_native_request_model(&body) {
-        log_native_request_completed(
-            &log,
-            &req_id,
-            "responses",
-            None,
-            response.status(),
-            started_at,
-        );
-        return monitor_response_body(response, request_guard);
-    }
-    let model = body
-        .get("model")
-        .and_then(Value::as_str)
-        .map(normalize_incoming_model);
-    let effort = body
-        .pointer("/reasoning/effort")
-        .and_then(Value::as_str)
-        .map(str::to_string);
-    let now = current_millis();
-    let session_state = if let Some(session_id) = session_id.as_deref() {
-        session::existing_session(Some(session_id), now)
-    } else {
-        None
+    let (requested_model, normalized_model) = match extract_model(&body) {
+        Ok(model) => model,
+        Err(error) => return monitor_response_body(error.response(), request_guard),
     };
-    let current = model.as_deref().and_then(|model| {
-        session::record_session_request(
-            session_id.as_deref(),
-            session_state.as_ref(),
-            "codex",
-            model,
-            now,
+    let now = current_millis();
+    let session_state = session::existing_session(session_id.as_deref(), now);
+    let affinity = session_state
+        .as_ref()
+        .and_then(|session| session.affinity_provider.as_ref());
+    let Some(provider) = state
+        .registry
+        .provider_for_model(&normalized_model, affinity)
+    else {
+        let response = OpenAiError::invalid(
+            format!(
+                "Unknown model \"{normalized_model}\". {}",
+                state.registry.unknown_model_message()
+            ),
+            Some("model"),
         )
-    });
+        .response();
+        return monitor_response_body(response, request_guard);
+    };
+    let parsed = if provider.name() == "codex" {
+        if let Err(response) = validate_native_request_model(&body) {
+            return monitor_response_body(response, request_guard);
+        }
+        None
+    } else {
+        match parse_request(
+            OpenAiSurface::Responses,
+            body.clone(),
+            provider.name(),
+            session_id.as_deref(),
+        ) {
+            Ok(parsed) => Some(parsed),
+            Err(error) => return monitor_response_body(error.response(), request_guard),
+        }
+    };
+    if provider.name() != "codex"
+        && let Some(session_id) = session_id.as_deref()
+    {
+        crate::providers::codex::clear_session_compaction(session_id);
+    }
+    let current = session::record_session_request(
+        session_id.as_deref(),
+        session_state.as_ref(),
+        provider.name(),
+        &normalized_model,
+        now,
+    );
+    let effort = parsed
+        .as_ref()
+        .and_then(|parsed| {
+            parsed
+                .messages
+                .extra
+                .get("output_config")
+                .and_then(|value| value.get("effort"))
+                .and_then(Value::as_str)
+        })
+        .or_else(|| body.pointer("/reasoning/effort").and_then(Value::as_str))
+        .map(str::to_string);
     if let Some(monitor) = state.monitor.as_ref() {
         if let Some(current) = current.as_ref() {
             monitor.session_sequence_resolved(&req_id, current.seq);
         }
-        if let Some(model) = model.as_deref() {
-            monitor.provider_selected(&req_id, "codex", model, effort);
-        }
+        monitor.provider_selected(&req_id, provider.name(), &normalized_model, effort);
     }
-
     let traffic = create_traffic_capture(TrafficCaptureOptions {
         req_id: req_id.clone(),
         session_id: session_id.clone(),
-        session_seq: current.as_ref().map(|state| state.seq),
-        provider: Some("codex".to_string()),
+        session_seq: current.as_ref().map(|session| session.seq),
+        provider: Some(provider.name().to_string()),
         state_dir_override: None,
     })
     .map(Arc::new);
@@ -701,10 +969,11 @@ async fn handler_responses(State(state): State<Arc<AppState>>, req: Request<Body
             &json!({
                 "reqId": &req_id,
                 "sessionId": &session_id,
-                "sessionSeq": current.as_ref().map(|state| state.seq),
+                "sessionSeq": current.as_ref().map(|session| session.seq),
                 "kind": "responses",
-                "provider": "codex",
-                "model": &model,
+                "provider": provider.name(),
+                "model": &normalized_model,
+                "requestedModel": &requested_model,
                 "method": method.as_str(),
                 "path": &path,
                 "query": &query,
@@ -712,31 +981,67 @@ async fn handler_responses(State(state): State<Arc<AppState>>, req: Request<Body
             }),
         );
         capture.write_json("010-openai-responses-request", &body);
+        if let Some(parsed) = parsed.as_ref() {
+            capture.write_json(
+                "015-anthropic-request",
+                &serde_json::to_value(&parsed.messages).unwrap_or_else(|_| json!({})),
+            );
+        }
     }
-
     let context = RequestContext {
         req_id: req_id.clone(),
         session_id,
-        session_seq: current.map(|state| state.seq),
-        provider: "codex".to_string(),
-        traffic,
+        session_seq: current.map(|session| session.seq),
+        provider: provider.name().to_string(),
+        traffic: traffic.clone(),
         monitor: state.monitor.clone(),
     };
-    let response = match state.native_responses.as_ref() {
-        Some(backend) => backend.handle(body, context).await,
-        None => openai_error(
-            StatusCode::NOT_FOUND,
-            "not_found_error",
-            "Native Responses API is disabled",
-            None,
-            None,
-        ),
+    let response = if let Some(parsed) = parsed {
+        match provider
+            .generate_anthropic_stream(parsed.messages, context)
+            .await
+        {
+            Ok(generation) => {
+                if let Some(capture) = traffic.as_ref() {
+                    capture.write_json(
+                        "016-model-resolution",
+                        &json!({"requestedModel":requested_model,"resolvedModel":generation.resolved_model}),
+                    );
+                }
+                match render_openai_response(
+                    OpenAiSurface::Responses,
+                    generation,
+                    parsed.stream,
+                    parsed.include_usage,
+                    parsed.response_metadata,
+                    traffic.clone(),
+                )
+                .await
+                {
+                    Ok(response) => response,
+                    Err(error) => error.response(),
+                }
+            }
+            Err(error) => OpenAiError::from(error).response(),
+        }
+    } else {
+        match state.native_responses.as_ref() {
+            Some(backend) => backend.handle(body, context).await,
+            None => openai_error(
+                StatusCode::NOT_FOUND,
+                "not_found_error",
+                "Native Responses API is disabled",
+                None,
+                None,
+            ),
+        }
     };
-    log_native_request_completed(
+    log_routed_openai_request_completed(
         &log,
         &req_id,
         "responses",
-        model.as_deref(),
+        provider.name(),
+        Some(&normalized_model),
         response.status(),
         started_at,
     );
@@ -775,15 +1080,15 @@ async fn handler_chat_completions(
         );
     }
     let request_guard = RequestMonitorGuard::new(state.monitor.clone(), req_id.clone());
-    let body_bytes = match axum::body::to_bytes(req.into_body(), usize::MAX).await {
+    let body_bytes = match axum::body::to_bytes(req.into_body(), MAX_OPENAI_REQUEST_BYTES).await {
         Ok(bytes) => bytes,
-        Err(error) => {
+        Err(_) => {
             let response = openai_error(
-                StatusCode::BAD_REQUEST,
+                StatusCode::PAYLOAD_TOO_LARGE,
                 "invalid_request_error",
-                format!("Invalid JSON: {error}"),
+                "Request body exceeded the size limit".to_string(),
                 None,
-                Some("invalid_json"),
+                Some("request_too_large"),
             );
             log_native_request_completed(
                 &log,
@@ -810,50 +1115,84 @@ async fn handler_chat_completions(
             return monitor_response_body(response, request_guard);
         }
     };
-    let translated = match translate_request(body.clone()) {
-        Ok(translated) => translated,
-        Err(error) => {
-            let response = error.response();
-            log_native_request_completed(
-                &log,
-                &req_id,
-                "chat_completions",
-                None,
-                response.status(),
-                started_at,
-            );
-            return monitor_response_body(response, request_guard);
-        }
+    let (requested_model, normalized_model) = match extract_model(&body) {
+        Ok(model) => model,
+        Err(error) => return monitor_response_body(error.response(), request_guard),
     };
-
     let now = current_millis();
-    let session_state = session_id
-        .as_deref()
-        .and_then(|session_id| session::existing_session(Some(session_id), now));
+    let session_state = session::existing_session(session_id.as_deref(), now);
+    let affinity = session_state
+        .as_ref()
+        .and_then(|session| session.affinity_provider.as_ref());
+    let Some(provider) = state
+        .registry
+        .provider_for_model(&normalized_model, affinity)
+    else {
+        let response = OpenAiError::invalid(
+            format!(
+                "Unknown model \"{normalized_model}\". {}",
+                state.registry.unknown_model_message()
+            ),
+            Some("model"),
+        )
+        .response();
+        return monitor_response_body(response, request_guard);
+    };
+    let (translated, parsed) = if provider.name() == "codex" {
+        let translated = match translate_request(body.clone()) {
+            Ok(translated) => translated,
+            Err(error) => return monitor_response_body(error.response(), request_guard),
+        };
+        (Some(translated), None)
+    } else {
+        let parsed = match parse_request(
+            OpenAiSurface::ChatCompletions,
+            body.clone(),
+            provider.name(),
+            session_id.as_deref(),
+        ) {
+            Ok(parsed) => parsed,
+            Err(error) => return monitor_response_body(error.response(), request_guard),
+        };
+        (None, Some(parsed))
+    };
+    if provider.name() != "codex"
+        && let Some(session_id) = session_id.as_deref()
+    {
+        crate::providers::codex::clear_session_compaction(session_id);
+    }
     let current = session::record_session_request(
         session_id.as_deref(),
         session_state.as_ref(),
-        "codex",
-        &translated.model,
+        provider.name(),
+        &normalized_model,
         now,
     );
+    let effort = translated
+        .as_ref()
+        .and_then(|translated| translated.effort.clone())
+        .or_else(|| {
+            parsed.as_ref().and_then(|parsed| {
+                parsed
+                    .messages
+                    .extra
+                    .get("output_config")
+                    .and_then(|value| value.get("effort"))
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            })
+        });
     if let Some(monitor) = state.monitor.as_ref() {
         if let Some(current) = current.as_ref() {
             monitor.session_sequence_resolved(&req_id, current.seq);
         }
-        monitor.provider_selected(
-            &req_id,
-            "codex",
-            &translated.model,
-            translated.effort.clone(),
-        );
+        monitor.provider_selected(&req_id, provider.name(), &normalized_model, effort.clone());
     }
-
     let traffic = create_traffic_capture(TrafficCaptureOptions {
         req_id: req_id.clone(),
         session_id: session_id.clone(),
-        session_seq: current.as_ref().map(|state| state.seq),
-        provider: Some("codex".to_string()),
+        session_seq: current.as_ref().map(|session| session.seq),
+        provider: Some(provider.name().to_string()),
         state_dir_override: None,
     })
     .map(Arc::new);
@@ -866,12 +1205,12 @@ async fn handler_chat_completions(
             &json!({
                 "reqId": &req_id,
                 "sessionId": &session_id,
-                "sessionSeq": current.as_ref().map(|state| state.seq),
+                "sessionSeq": current.as_ref().map(|session| session.seq),
                 "kind": "chat_completions",
-                "provider": "codex",
-                "model": &translated.model,
-                "requestedModel": &translated.requested_model,
-                "effort": &translated.effort,
+                "provider": provider.name(),
+                "model": &normalized_model,
+                "requestedModel": &requested_model,
+                "effort": &effort,
                 "method": method.as_str(),
                 "path": &path,
                 "query": &query,
@@ -879,32 +1218,71 @@ async fn handler_chat_completions(
             }),
         );
         capture.write_json("010-openai-chat-completions-request", &body);
-        capture.write_json("020-upstream-request", &translated.upstream);
+        if let Some(translated) = translated.as_ref() {
+            capture.write_json("020-upstream-request", &translated.upstream);
+        }
+        if let Some(parsed) = parsed.as_ref() {
+            capture.write_json(
+                "015-anthropic-request",
+                &serde_json::to_value(&parsed.messages).unwrap_or_else(|_| json!({})),
+            );
+        }
     }
-
     let context = RequestContext {
         req_id: req_id.clone(),
         session_id,
-        session_seq: current.map(|state| state.seq),
-        provider: "codex".to_string(),
-        traffic,
+        session_seq: current.map(|session| session.seq),
+        provider: provider.name().to_string(),
+        traffic: traffic.clone(),
         monitor: state.monitor.clone(),
     };
-    let response = match state.chat_completions.as_ref() {
-        Some(backend) => backend.handle(translated.clone(), context).await,
-        None => openai_error(
-            StatusCode::NOT_FOUND,
-            "not_found_error",
-            "Chat Completions API is disabled",
-            None,
-            None,
-        ),
+    let response = if let Some(translated) = translated {
+        match state.chat_completions.as_ref() {
+            Some(backend) => backend.handle(translated, context).await,
+            None => openai_error(
+                StatusCode::NOT_FOUND,
+                "not_found_error",
+                "Chat Completions API is disabled",
+                None,
+                None,
+            ),
+        }
+    } else {
+        let parsed = parsed.expect("non-Codex request was parsed");
+        match provider
+            .generate_anthropic_stream(parsed.messages, context)
+            .await
+        {
+            Ok(generation) => {
+                if let Some(capture) = traffic.as_ref() {
+                    capture.write_json(
+                        "016-model-resolution",
+                        &json!({"requestedModel":requested_model,"resolvedModel":generation.resolved_model}),
+                    );
+                }
+                match render_openai_response(
+                    OpenAiSurface::ChatCompletions,
+                    generation,
+                    parsed.stream,
+                    parsed.include_usage,
+                    parsed.response_metadata,
+                    traffic.clone(),
+                )
+                .await
+                {
+                    Ok(response) => response,
+                    Err(error) => error.response(),
+                }
+            }
+            Err(error) => OpenAiError::from(error).response(),
+        }
     };
-    log_native_request_completed(
+    log_routed_openai_request_completed(
         &log,
         &req_id,
         "chat_completions",
-        Some(&translated.model),
+        provider.name(),
+        Some(&normalized_model),
         response.status(),
         started_at,
     );
@@ -949,6 +1327,29 @@ fn parse_native_json_body(body: &[u8]) -> Result<Value, Response> {
     })
 }
 
+fn log_routed_openai_request_completed(
+    log: &Logger,
+    req_id: &str,
+    endpoint: &str,
+    provider: &str,
+    model: Option<&str>,
+    status: StatusCode,
+    started_at: Instant,
+) {
+    log.info(
+        "request_completed",
+        Some(serde_json::Map::from_iter([
+            ("reqId".to_string(), json!(req_id)),
+            ("endpoint".to_string(), json!(endpoint)),
+            ("provider".to_string(), json!(provider)),
+            ("model".to_string(), json!(model)),
+            ("countTokens".to_string(), json!(false)),
+            ("status".to_string(), json!(status.as_u16())),
+            ("ms".to_string(), json!(started_at.elapsed().as_millis())),
+        ])),
+    );
+}
+
 fn log_native_request_completed(
     log: &Logger,
     req_id: &str,
@@ -982,6 +1383,9 @@ async fn dispatch_request(
     let method = req.method().clone();
     let uri = req.uri().clone();
     let headers = req.headers().clone();
+    let conversation_identity = (!count_tokens)
+        .then(|| ConversationIdentity::from_headers(&headers))
+        .flatten();
     let path = uri.path().to_string();
     let query = redacted_query(&uri);
     let endpoint = if count_tokens {
@@ -1008,7 +1412,7 @@ async fn dispatch_request(
     }
     let request_guard = RequestMonitorGuard::new(state.monitor.clone(), req_id.clone());
     let now = current_millis();
-    let body_bytes = match axum::body::to_bytes(req.into_body(), usize::MAX).await {
+    let body_bytes = match axum::body::to_bytes(req.into_body(), MAX_OPENAI_REQUEST_BYTES).await {
         Ok(bytes) => bytes,
         Err(err) => {
             let response = json_error(
@@ -1321,7 +1725,17 @@ async fn dispatch_request(
     let response = if count_tokens {
         provider.handle_count_tokens(body, context).await
     } else {
-        provider.handle_messages(body, context).await
+        provider
+            .handle_messages_with_conversation_identity(
+                body,
+                context,
+                if auto_review_route.is_some() {
+                    None
+                } else {
+                    conversation_identity
+                },
+            )
+            .await
     };
     log_request_completed(
         &log,
@@ -1640,7 +2054,15 @@ fn headers_to_record(headers: &http::HeaderMap) -> Value {
     let mut out = Map::new();
     for (key, value) in headers {
         if let Ok(raw) = value.to_str() {
-            out.insert(key.as_str().to_string(), Value::String(raw.to_string()));
+            let value = if matches!(
+                key.as_str(),
+                CLAUDE_AGENT_HEADER | CLAUDE_PARENT_AGENT_HEADER
+            ) {
+                format!("[redacted len={}]", raw.len())
+            } else {
+                raw.to_string()
+            };
+            out.insert(key.as_str().to_string(), Value::String(value));
         }
     }
     Value::Object(out)
@@ -1724,8 +2146,10 @@ fn _unused(session_state: Option<&SessionState>) {
 
 #[cfg(test)]
 mod auto_review_tests {
-    use super::{apply_auto_review_model, is_claude_auto_review_request};
+    use super::{apply_auto_review_model, headers_to_record, is_claude_auto_review_request};
     use crate::anthropic::schema::MessagesRequest;
+    use crate::request_identity::{CLAUDE_AGENT_HEADER, CLAUDE_PARENT_AGENT_HEADER};
+    use http::{HeaderMap, HeaderValue};
     use serde_json::json;
 
     fn request(system: &str, stream: bool, tools: serde_json::Value) -> MessagesRequest {
@@ -1806,6 +2230,37 @@ mod auto_review_tests {
             .expect("configured classifier should be routed");
         assert_eq!(route.override_model, "grok-4.5");
         assert_eq!(classifier.model.as_deref(), Some("grok-4.5"));
+    }
+
+    #[test]
+    fn traffic_headers_redact_agent_lineage_ids() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-claude-code-session-id",
+            HeaderValue::from_static("session-visible"),
+        );
+        headers.insert(
+            CLAUDE_AGENT_HEADER,
+            HeaderValue::from_static("agent-secret"),
+        );
+        headers.insert(
+            CLAUDE_PARENT_AGENT_HEADER,
+            HeaderValue::from_static("parent-secret"),
+        );
+
+        let captured = headers_to_record(&headers);
+        assert_eq!(
+            captured["x-claude-code-session-id"],
+            json!("session-visible")
+        );
+        assert_eq!(captured[CLAUDE_AGENT_HEADER], json!("[redacted len=12]"));
+        assert_eq!(
+            captured[CLAUDE_PARENT_AGENT_HEADER],
+            json!("[redacted len=13]")
+        );
+        let serialized = captured.to_string();
+        assert!(!serialized.contains("agent-secret"));
+        assert!(!serialized.contains("parent-secret"));
     }
 
     #[test]

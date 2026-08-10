@@ -3,7 +3,7 @@ title: Getting started
 description: Install claude-code-proxy, authenticate with Codex, start the server, and open one working Claude Code session.
 ---
 
-This path gets one Codex-backed Claude Code session working. See [Choosing a provider](/providers/choosing-a-provider/) for Kimi, Grok, Cursor Agent, and Kiro.
+This path gets one Codex-backed Claude Code session working. See [Choosing a provider](/providers/choosing-a-provider/) for Kimi, Grok, OpenCode Go, Cursor Agent, and Kiro.
 
 ## 1. Install
 

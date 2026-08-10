@@ -50,6 +50,10 @@ Claude Code's `/effort` selects matching Cursor catalog variants when available.
 - The native tool bridge recognizes Cursor requests for `Read`, `Write`, and `Bash` when matching Claude tools are advertised and a Claude Code session ID is present. It pauses the stream, emits an Anthropic tool call, accepts the next tool result, and resumes stored events.
 - Other Cursor workspace callbacks and native tool forms do not have a general Claude tool bridge.
 
+## OpenAI-compatible APIs
+
+When the OpenAI routes are enabled, Cursor models work with both `POST /v1/chat/completions` and `POST /v1/responses`. To use the `Read`, `Write`, or `Bash` tool bridge, send `stream: true`, define the matching function tools, and include a stable session header. The proxy accepts `x-claude-code-session-id`, `session_id`, or `x-client-request-id`. Other function names are not supported by the Cursor bridge.
+
 ## Session continuation
 
 The proxy maps `x-claude-code-session-id` to a Cursor conversation ID in memory. Request metadata can resume a known Cursor chat through `cursor_chat_id`, `cursorChatId`, `cursor_resume`, or `cursorResume`. A proxy restart clears the in-memory mapping.

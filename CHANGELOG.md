@@ -5,13 +5,61 @@ description: Release notes for claude-code-proxy.
 
 ## Unreleased
 
-- Kiro (AWS CodeWhisperer/Q) joins Codex, Kimi, Grok, and Cursor Agent as a
-  supported provider. Sign in with an AWS IAM Identity Center or Builder ID
-  account, or reuse an existing Kiro IDE or kiro-cli login. Serves real
-  Claude Sonnet/Opus/Haiku tiers alongside DeepSeek, Kimi, MiniMax, GLM, and
-  Qwen models, selectable via the `kiro:` prefix or as the configured
-  `aliasProvider`. `claude-code-proxy kiro auth login/device/status/logout`
-  manages credentials.
+- Kiro (AWS CodeWhisperer/Q) joins Codex, Kimi, Grok, OpenCode Go, and
+  Cursor Agent as a supported provider. Sign in with an AWS IAM Identity
+  Center or Builder ID account, or reuse an existing Kiro IDE or kiro-cli
+  login. Serves real Claude Sonnet/Opus/Haiku tiers alongside DeepSeek,
+  Kimi, MiniMax, GLM, and Qwen models, selectable via the `kiro:` prefix or
+  as the configured `aliasProvider`.
+  `claude-code-proxy kiro auth login/device/status/logout` manages
+  credentials.
+
+## v0.1.32 (2026-08-03)
+
+- Kimi subagents and multimodal messages with mixed text and images work instead
+  of failing with an invalid content-part error.
+  ([#98](https://github.com/raine/claude-code-proxy/issues/98),
+  [#99](https://github.com/raine/claude-code-proxy/pull/99))
+
+## v0.1.31 (2026-08-02)
+
+- OpenCode Go subscriptions can power Claude Code with supported OpenAI, Google,
+  and Anthropic models through the new OpenCode Go provider.
+- Codex HTTP responses stream as they arrive, remain active during quiet periods,
+  and recover safely from temporary failures before model output begins.
+  ([#51](https://github.com/raine/claude-code-proxy/pull/51))
+- OpenAI-compatible requests preserve the caller's parallel tool-call setting
+  across Codex, Kimi, and Grok routes.
+- Claude Code agents sharing a session keep independent Codex continuation state,
+  preventing one agent from consuming or replacing another agent's context.
+  ([#96](https://github.com/raine/claude-code-proxy/pull/96))
+- Overlapping Codex compaction requests preserve the correct conversation history
+  and summary. ([#94](https://github.com/raine/claude-code-proxy/pull/94))
+- Monitor session token totals remain accurate as older requests leave the recent
+  request list or receive stale usage updates.
+
+## v0.1.30 (2026-07-31)
+
+- OpenAI-compatible clients can use Kimi, Grok, Cursor, or Codex through the
+  optional `POST /v1/chat/completions` and `POST /v1/responses` endpoints, with
+  support for streaming, reasoning, function tools, usage, and provider routing.
+- Codex users can transcribe audio through the optional OpenAI-compatible
+  `POST /v1/audio/transcriptions` endpoint using the existing Codex sign-in.
+  Enable it with `codex.transcriptionsApi` or
+  `CCP_CODEX_TRANSCRIPTIONS_API=1`.
+- Codex token estimates accurately count CJK text, long identifiers, minified
+  code, and base64-like content, improving context and compaction decisions.
+  ([#90](https://github.com/raine/claude-code-proxy/pull/90))
+- Codex WebSocket sessions remain reliable under high concurrency instead of
+  failing with 403 upgrade rejections.
+  ([#87](https://github.com/raine/claude-code-proxy/issues/87),
+  [#88](https://github.com/raine/claude-code-proxy/pull/88))
+
+## v0.1.29 (2026-07-30)
+
+- Codex honors required, disabled, and single-tool choices from Claude Code, and
+  disables parallel tool calls when requested.
+  ([#89](https://github.com/raine/claude-code-proxy/pull/89))
 
 ## v0.1.28 (2026-07-29)
 

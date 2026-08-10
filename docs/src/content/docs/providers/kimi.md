@@ -37,6 +37,10 @@ Claude Code's `/effort` setting maps to Kimi `reasoning_effort` at `low`, `mediu
 - Images inside tool results map to `image_url` parts in tool messages.
 - Supported video input maps to Kimi video content.
 
+## OpenAI-compatible APIs
+
+When the OpenAI routes are enabled, Kimi models work with both `POST /v1/chat/completions` and `POST /v1/responses`. You can use text, supported images, reasoning effort, function tools, tool results, token limits, streaming, and usage reporting. See [HTTP API](/reference/http-api/) for the accepted request fields.
+
 ## Configuration
 
 `CCP_KIMI_BASE_URL`, `CCP_KIMI_OAUTH_HOST`, and `CCP_KIMI_USER_AGENT` provide explicit endpoint and client overrides. `CCP_USER_AGENT` is the fallback user-agent override. These settings are intended for compatibility and controlled debugging. See [Configuration](/reference/configuration/) for defaults and file keys.

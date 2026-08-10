@@ -66,11 +66,25 @@ pub(crate) fn record_session_request_with_affinity_update(
 ) -> Option<SessionState> {
     let id = session_id?;
     let mut store = SESSIONS.lock().expect("session lock");
-    let mut next = prior.cloned().unwrap_or(SessionState {
-        seq: 0,
-        affinity_provider: None,
-        last_seen: now,
-    });
+    let stored = store
+        .map
+        .get(id)
+        .cloned()
+        .filter(|state| now.saturating_sub(state.last_seen) <= SESSION_IDLE_TTL_MS);
+    if stored.is_none() && store.map.remove(id).is_some() {
+        store.order.retain(|item| item != id);
+    }
+    let mut next = stored
+        .or_else(|| {
+            prior
+                .filter(|state| now.saturating_sub(state.last_seen) <= SESSION_IDLE_TTL_MS)
+                .cloned()
+        })
+        .unwrap_or(SessionState {
+            seq: 0,
+            affinity_provider: None,
+            last_seen: now,
+        });
     next.seq += 1;
     next.last_seen = now;
     if update_affinity
@@ -147,6 +161,35 @@ mod tests {
         let state =
             record_session_request(Some(session_id), None, "kiro", "sonnet", 1).expect("session");
         assert_eq!(state.affinity_provider, None);
+    }
+
+    #[test]
+    fn concurrent_requests_increment_latest_sequence() {
+        let session_id = "session-concurrent-sequence-test";
+        let initial = record_session_request(Some(session_id), None, "codex", "gpt-5.6-sol", 1)
+            .expect("initial session");
+        let handles: Vec<_> = (0..16)
+            .map(|offset| {
+                let stale = initial.clone();
+                std::thread::spawn(move || {
+                    record_session_request(
+                        Some(session_id),
+                        Some(&stale),
+                        "codex",
+                        "gpt-5.6-sol",
+                        2 + offset,
+                    )
+                    .expect("recorded session")
+                    .seq
+                })
+            })
+            .collect();
+        let mut sequences: Vec<_> = handles
+            .into_iter()
+            .map(|handle| handle.join().expect("session thread"))
+            .collect();
+        sequences.sort_unstable();
+        assert_eq!(sequences, (2..=17).collect::<Vec<_>>());
     }
 
     #[test]

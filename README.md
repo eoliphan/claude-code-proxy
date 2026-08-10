@@ -1,13 +1,17 @@
 # claude-code-proxy
 
-Claude Code, powered by **OpenAI Codex**, **Kimi**, **Grok**, **Cursor
-Agent**, or **Kiro**.
+Claude Code, powered by **OpenAI Codex**, **Kimi**, **Grok**, **OpenCode
+Go**, **Cursor Agent**, or **Kiro**.
 
 Docs: <https://claude-code-proxy.raine.dev>
 
 LLM docs: <https://claude-code-proxy.raine.dev/llms.txt>
 
 <img src="meta/claude-code-screenshot-2026-07.webp" alt="Claude Code running through claude-code-proxy" />
+
+> [!TIP]
+> I'm building [aven](https://github.com/raine/aven), a local-first task manager
+> for power users and agents.
 
 ## Why?
 
@@ -84,6 +88,7 @@ The opt-in Images API returns base64 image data and consumes the signed-in accou
 | Codex        | ChatGPT Plus or Pro            | Registered `gpt-*` models and `-fast` variants  |
 | Kimi         | kimi.com with Kimi Code access | `kimi-for-coding` and aliases                   |
 | Grok         | grok.com                       | Registered Grok models                          |
+| OpenCode Go  | OpenCode Go subscription       | Non-conflicting IDs and `opencode-go/<model-id>` |
 | Cursor Agent | Cursor account                 | Cursor aliases and `cursor:<model-id>` prefixes |
 | Kiro         | AWS IAM Identity Center or Builder ID | Claude/DeepSeek/Kimi/MiniMax/GLM/Qwen tiers and `kiro:<model-id>` prefixes |
 

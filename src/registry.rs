@@ -83,6 +83,10 @@ impl Registry {
                 .map(|m| m.id.to_string())
                 .collect(),
         );
+        models.insert(
+            "opencode".into(),
+            crate::providers::opencode::advertised_models(),
+        );
 
         let mut handlers = BTreeMap::new();
         for (name, entries) in &models {
@@ -92,6 +96,7 @@ impl Registry {
                 "cursor" => Arc::new(crate::providers::cursor::CursorProvider::new()),
                 "grok" => Arc::new(crate::providers::grok::GrokProvider::new()),
                 "kiro" => Arc::new(crate::providers::kiro::KiroProvider::new()),
+                "opencode" => Arc::new(crate::providers::opencode::OpenCodeProvider::new()),
                 _ => Arc::new(PlaceholderProvider::new(name, entries.clone())),
             };
             handlers.insert(name.clone(), handler);
@@ -106,6 +111,24 @@ impl Registry {
 
     pub fn with_default_alias() -> Self {
         Self::new(crate::config::alias_provider())
+    }
+
+    pub fn from_providers(
+        alias_provider: AliasProvider,
+        providers: impl IntoIterator<Item = Arc<dyn Provider>>,
+    ) -> Self {
+        let mut models = BTreeMap::new();
+        let mut handlers = BTreeMap::new();
+        for provider in providers {
+            let name = provider.name().to_string();
+            models.insert(name.clone(), provider.supported_models());
+            handlers.insert(name, provider);
+        }
+        Self {
+            alias_provider,
+            models,
+            handlers,
+        }
     }
 
     pub fn list_provider_names(&self) -> Vec<String> {
@@ -489,5 +512,48 @@ mod tests {
         let registry = Registry::new(AliasProvider::Codex);
         let p = registry.provider_for_model("deepseek-3-2", None);
         assert_eq!(p.expect("provider").name(), "kiro");
+    }
+
+    #[test]
+    fn opencode_models_route_without_stealing_existing_provider_ids() {
+        let registry = Registry::new(AliasProvider::Codex);
+        assert_eq!(
+            registry
+                .provider_for_model("kimi-k2.7-code", None)
+                .unwrap()
+                .name(),
+            "opencode"
+        );
+        assert_eq!(
+            registry
+                .provider_for_model("opencode-go/kimi-k2.6", None)
+                .unwrap()
+                .name(),
+            "opencode"
+        );
+        assert_eq!(
+            registry
+                .provider_for_model("kimi-k2.6", None)
+                .unwrap()
+                .name(),
+            "kimi"
+        );
+        for (model, owner) in [
+            ("gpt-5.6-luna", "codex"),
+            ("grok-4.5", "grok"),
+            ("kimi-k3", "kimi"),
+        ] {
+            assert_eq!(
+                registry.provider_for_model(model, None).unwrap().name(),
+                owner
+            );
+            assert_eq!(
+                registry
+                    .provider_for_model(&format!("opencode-go/{model}"), None)
+                    .unwrap()
+                    .name(),
+                "opencode"
+            );
+        }
     }
 }

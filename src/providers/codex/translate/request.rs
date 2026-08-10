@@ -7,7 +7,8 @@ use serde_json::Value;
 use crate::anthropic::schema::MessagesRequest;
 use crate::config;
 use crate::providers::translate_shared::{
-    ContentBlock, flatten_system_text, image_source_to_url, normalize_content, read_effort,
+    ContentBlock, flatten_system_text, image_source_to_url, normalize_content, parallel_tool_calls,
+    read_effort,
 };
 
 use super::read_rewrite::{ReadOffsetRewrite, read_offset_rewrite};
@@ -49,11 +50,17 @@ pub enum ServiceTier {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(untagged)]
-pub enum ResponsesToolChoice {
+#[serde(rename_all = "snake_case")]
+pub enum ResponsesToolChoiceMode {
     Auto,
     None,
     Required,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum ResponsesToolChoice {
+    Mode(ResponsesToolChoiceMode),
     Function {
         r#type: String,
         name: String,
@@ -422,11 +429,37 @@ pub fn translate_request(
     req: &MessagesRequest,
     opts: TranslateOptions,
 ) -> Result<ResponsesRequest, anyhow::Error> {
+    translate_request_inner(req, opts, true)
+}
+
+pub fn translate_openai_compatible_request(
+    req: &MessagesRequest,
+    model: String,
+    session_id: Option<String>,
+) -> Result<ResponsesRequest, anyhow::Error> {
+    translate_request_inner(
+        req,
+        TranslateOptions {
+            session_id,
+            service_tier: None,
+            model,
+            use_responses_lite: false,
+        },
+        false,
+    )
+}
+
+fn translate_request_inner(
+    req: &MessagesRequest,
+    opts: TranslateOptions,
+    apply_codex_config: bool,
+) -> Result<ResponsesRequest, anyhow::Error> {
     let instructions = flatten_system_text(req.extra.get("system"));
     let is_compact = is_compact_messages_request(req);
     let input = build_input(req);
     let tools = read_tools(req)?;
     let tool_choice = map_tool_choice(req)?;
+    let parallel_tool_calls = parallel_tool_calls(req).unwrap_or(true);
 
     let mut text = ResponsesText {
         verbosity: Some("low".to_string()),
@@ -443,7 +476,7 @@ pub fn translate_request(
         input,
         store: false,
         stream: true,
-        parallel_tool_calls: true,
+        parallel_tool_calls,
         tool_choice,
         text,
         tools: None,
@@ -504,7 +537,7 @@ pub fn translate_request(
                 .any(|tool| matches!(tool, ResponsesTool::WebSearch(_)))
         });
         if !has_web_search {
-            out.tool_choice = Some(ResponsesToolChoice::Auto);
+            out.tool_choice = Some(ResponsesToolChoice::Mode(ResponsesToolChoiceMode::Auto));
         }
     }
 
@@ -512,15 +545,22 @@ pub fn translate_request(
         out.prompt_cache_key = Some(sid);
     }
 
-    let service_tier = resolve_service_tier(opts.service_tier)?;
-    if let Some(ref tier) = service_tier {
-        out.service_tier = Some(tier.clone());
+    if apply_codex_config {
+        let service_tier = resolve_service_tier(opts.service_tier)?;
+        if let Some(ref tier) = service_tier {
+            out.service_tier = Some(tier.clone());
+        }
     }
 
     let effort = read_effort(req)?;
     let codex_effort = to_codex_effort(effort);
-    let mut resolved_effort = resolve_effort(codex_effort)?;
-    if is_compact
+    let mut resolved_effort = if apply_codex_config {
+        resolve_effort(codex_effort)?
+    } else {
+        codex_effort
+    };
+    if apply_codex_config
+        && is_compact
         && let Some(cap) = compact_effort_cap()
         && resolved_effort.as_ref().is_some_and(|e| *e > cap)
     {
@@ -528,7 +568,8 @@ pub fn translate_request(
     }
     if resolved_effort.is_some() || opts.use_responses_lite {
         let summary = if resolved_effort.is_some()
-            && reasoning_summary_requested(config::codex_reasoning_summary().as_deref())
+            && (!apply_codex_config
+                || reasoning_summary_requested(config::codex_reasoning_summary().as_deref()))
         {
             Some("auto".to_string())
         } else {
@@ -698,10 +739,10 @@ fn map_tool_choice(req: &MessagesRequest) -> Result<Option<ResponsesToolChoice>,
         Some(Value::Object(m)) => m,
         Some(Value::String(s)) => {
             return Ok(Some(match s.as_str() {
-                "auto" => ResponsesToolChoice::Auto,
-                "none" => ResponsesToolChoice::None,
-                "any" | "required" => ResponsesToolChoice::Required,
-                _ => ResponsesToolChoice::Auto,
+                "auto" => ResponsesToolChoice::Mode(ResponsesToolChoiceMode::Auto),
+                "none" => ResponsesToolChoice::Mode(ResponsesToolChoiceMode::None),
+                "any" | "required" => ResponsesToolChoice::Mode(ResponsesToolChoiceMode::Required),
+                _ => ResponsesToolChoice::Mode(ResponsesToolChoiceMode::Auto),
             }));
         }
         _ => return Ok(None),
@@ -712,9 +753,15 @@ fn map_tool_choice(req: &MessagesRequest) -> Result<Option<ResponsesToolChoice>,
         .and_then(|v| v.as_str())
         .unwrap_or("auto");
     match choice_type {
-        "auto" => Ok(Some(ResponsesToolChoice::Auto)),
-        "none" => Ok(Some(ResponsesToolChoice::None)),
-        "any" | "required" => Ok(Some(ResponsesToolChoice::Required)),
+        "auto" => Ok(Some(ResponsesToolChoice::Mode(
+            ResponsesToolChoiceMode::Auto,
+        ))),
+        "none" => Ok(Some(ResponsesToolChoice::Mode(
+            ResponsesToolChoiceMode::None,
+        ))),
+        "any" | "required" => Ok(Some(ResponsesToolChoice::Mode(
+            ResponsesToolChoiceMode::Required,
+        ))),
         "tool" => {
             let name = choice.get("name").and_then(|v| v.as_str()).unwrap_or("");
             let tools = req.extra.get("tools").and_then(|v| v.as_array());
@@ -1100,6 +1147,95 @@ mod tests {
     }
 
     #[test]
+    fn responses_tool_choice_modes_serialize_as_openai_strings() {
+        for (mode, expected) in [
+            (ResponsesToolChoiceMode::Auto, json!("auto")),
+            (ResponsesToolChoiceMode::None, json!("none")),
+            (ResponsesToolChoiceMode::Required, json!("required")),
+        ] {
+            assert_eq!(
+                serde_json::to_value(ResponsesToolChoice::Mode(mode)).unwrap(),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn translate_tool_choice_preserves_wire_and_parallel_semantics() {
+        for (tool_choice, expected_choice, expected_parallel) in [
+            (json!({"type":"auto"}), json!("auto"), true),
+            (
+                json!({"type":"auto","disable_parallel_tool_use":false}),
+                json!("auto"),
+                true,
+            ),
+            (json!({"type":"none"}), json!("none"), true),
+            (json!({"type":"any"}), json!("required"), true),
+            (
+                json!({"type":"any","disable_parallel_tool_use":true}),
+                json!("required"),
+                false,
+            ),
+            (
+                json!({
+                    "type":"tool",
+                    "name":"test",
+                    "disable_parallel_tool_use":true
+                }),
+                json!({"type":"function","name":"test"}),
+                false,
+            ),
+        ] {
+            let req: MessagesRequest = serde_json::from_value(json!({
+                "model": "gpt-5.5",
+                "messages": [{"role":"user", "content":"use the tool"}],
+                "tools": [{
+                    "name":"test",
+                    "input_schema":{"type":"object","properties":{}}
+                }],
+                "tool_choice": tool_choice
+            }))
+            .unwrap();
+            let wire = serde_json::to_value(translate_request(&req, opts()).unwrap()).unwrap();
+
+            assert_eq!(wire["tool_choice"], expected_choice);
+            assert_eq!(wire["parallel_tool_calls"], expected_parallel);
+        }
+    }
+
+    #[test]
+    fn responses_lite_keeps_parallel_tool_calls_disabled() {
+        let req: MessagesRequest = serde_json::from_value(json!({
+            "model": "gpt-5.6-luna",
+            "messages": [{"role":"user", "content":"use the tool"}],
+            "tools": [{
+                "name":"test",
+                "input_schema":{"type":"object","properties":{}}
+            }],
+            "tool_choice": {
+                "type":"any",
+                "disable_parallel_tool_use":false
+            }
+        }))
+        .unwrap();
+        let wire = serde_json::to_value(
+            translate_request(
+                &req,
+                TranslateOptions {
+                    model: "gpt-5.6-luna".to_string(),
+                    use_responses_lite: true,
+                    ..opts()
+                },
+            )
+            .unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(wire["tool_choice"], json!("required"));
+        assert_eq!(wire["parallel_tool_calls"], false);
+    }
+
+    #[test]
     fn translate_web_search_tool_to_codex_tool() {
         let req: MessagesRequest = serde_json::from_value(json!({
             "model": "gpt-5.5",
@@ -1278,7 +1414,14 @@ mod tests {
         )
         .unwrap();
         assert!(out.tools.is_none());
-        assert!(matches!(out.tool_choice, Some(ResponsesToolChoice::Auto)));
+        assert!(matches!(
+            out.tool_choice,
+            Some(ResponsesToolChoice::Mode(ResponsesToolChoiceMode::Auto))
+        ));
+        assert_eq!(
+            serde_json::to_value(&out).unwrap()["tool_choice"],
+            json!("auto")
+        );
     }
 
     #[test]

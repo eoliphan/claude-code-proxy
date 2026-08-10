@@ -42,6 +42,10 @@ Claude Code hosted search tools map to Grok-native tools:
 - X queries use hosted `x_search`.
 - Citations and search usage return in Anthropic-compatible content and usage fields.
 
+## OpenAI-compatible APIs
+
+When the OpenAI routes are enabled, Grok models work with both `POST /v1/chat/completions` and `POST /v1/responses`. Text, reasoning, function tools, tool results, token limits, streaming, usage, and errors use the standard shape for the chosen route. Responses requests also return Grok searches as `web_search_call` items. Citations are available on both routes.
+
 ## Multimodal support
 
 `CCP_GROK_TOOL_IMAGE` controls image blocks in user messages and tool results:
