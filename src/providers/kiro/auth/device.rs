@@ -40,9 +40,9 @@ pub const IDC_PROBE_REGIONS: &[&str] = &[
 
 const BUILDER_ID_REGION: &str = "us-east-1";
 
-/// The User-Agent the Kiro backend expects on OIDC calls. Reused literally
-/// from the reference `login.ts` implementation — not this proxy's own UA.
-const OIDC_USER_AGENT: &str = "pi-cli";
+/// The User-Agent and `clientName` this proxy identifies itself with on
+/// OIDC calls, shown to the user on AWS's device-approval page.
+const OIDC_USER_AGENT: &str = "claude-code-proxy";
 
 pub trait DeviceLoginCallbacks {
     fn on_progress(&self, message: &str);
@@ -102,7 +102,7 @@ fn try_register_and_authorize(
     let client = reqwest::blocking::Client::new();
 
     let register_body = serde_json::json!({
-        "clientName": "pi-cli",
+        "clientName": OIDC_USER_AGENT,
         "clientType": "public",
         "scopes": SSO_SCOPES,
         "grantTypes": [
@@ -387,13 +387,17 @@ mod tests {
             .find(|r| r.contains("/client/register"))
             .expect("register request should have been sent");
         assert!(register_req.starts_with("POST /client/register"));
-        assert!(register_req.to_lowercase().contains("user-agent: pi-cli"));
+        assert!(
+            register_req
+                .to_lowercase()
+                .contains("user-agent: claude-code-proxy")
+        );
         assert!(
             register_req
                 .to_lowercase()
                 .contains("content-type: application/json")
         );
-        assert!(register_req.contains(r#""clientName":"pi-cli""#));
+        assert!(register_req.contains(r#""clientName":"claude-code-proxy""#));
         assert!(register_req.contains(r#""clientType":"public""#));
         assert!(register_req.contains("codewhisperer:completions"));
         assert!(register_req.contains("urn:ietf:params:oauth:grant-type:device_code"));

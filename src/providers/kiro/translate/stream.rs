@@ -40,6 +40,7 @@
 //!   that was streamed the moment it arrived, so it is detected and logged
 //!   rather than retried.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -59,7 +60,7 @@ use super::model_discovery::{self, PROFILE_CACHE};
 use super::models::{
     KiroModelMeta, approx_token_count, first_token_timeout_for, resolve_api_region,
 };
-use super::request::{BuildRequestOptions, build_kiro_request};
+use super::request::{BuildRequestOptions, build_kiro_request, build_tool_name_reverse_map};
 use super::thinking_parser::{ThinkingStreamEvent, ThinkingTagParser};
 
 type AuthManager = KiroAuthManager<FileAuthStore<KiroCredentials>>;
@@ -282,7 +283,11 @@ async fn drive(
         )
         .map_err(|e| FlowError::Terminal(KiroStreamError::Other(e)))?;
 
-        let mut state = AttemptState::new(opts.reasoning_enabled, opts.model.context_window);
+        let mut state = AttemptState::new(
+            opts.reasoning_enabled,
+            opts.model.context_window,
+            build_tool_name_reverse_map(opts.req),
+        );
         // Reset every outer iteration: each auth/stall retry gets a fresh
         // capacity budget.
         let mut capacity_retry_count: u32 = 0;
@@ -559,10 +564,18 @@ struct AttemptState {
     usage_input: Option<u64>,
     usage_output: Option<u64>,
     stream_error: Option<String>,
+    /// Shortened -> original tool name, for names `convert_tools_to_kiro`
+    /// had to shorten to fit Kiro's 64-char limit. Applied to every emitted
+    /// `tool_use` block so the client only ever sees the name it declared.
+    tool_name_map: HashMap<String, String>,
 }
 
 impl AttemptState {
-    fn new(reasoning_enabled: bool, context_window: u64) -> Self {
+    fn new(
+        reasoning_enabled: bool,
+        context_window: u64,
+        tool_name_map: HashMap<String, String>,
+    ) -> Self {
         Self {
             thinking_parser: reasoning_enabled.then(ThinkingTagParser::new),
             total_content: String::new(),
@@ -577,6 +590,7 @@ impl AttemptState {
             usage_input: None,
             usage_output: None,
             stream_error: None,
+            tool_name_map,
         }
     }
 }
@@ -735,8 +749,16 @@ async fn flush_tool_call(
     };
     match serde_json::from_str::<Value>(&final_input) {
         Ok(_) => {
+            // Kiro echoes back whatever (possibly shortened) name we
+            // declared; translate it back to the original before the
+            // client ever sees it.
+            let name = state
+                .tool_name_map
+                .get(&tool.name)
+                .map(String::as_str)
+                .unwrap_or(&tool.name);
             emitter
-                .tool_block(&tool.tool_use_id, &tool.name, &final_input)
+                .tool_block(&tool.tool_use_id, name, &final_input)
                 .await?;
             state.emitted_tool_calls += 1;
         }
@@ -1940,6 +1962,40 @@ mod tests {
         assert_eq!(tool_inputs(&sse), vec!["{}".to_string()]);
         let delta = find_frame(&sse, "message_delta").unwrap();
         assert_eq!(delta["delta"]["stop_reason"], "tool_use");
+    }
+
+    #[tokio::test]
+    async fn a_shortened_tool_name_kiro_echoes_back_is_translated_to_the_original_for_the_client() {
+        // A tool name over Kiro's 64-char limit gets shortened before it's
+        // ever declared to Kiro (see `convert_tools_to_kiro`); Kiro's
+        // response necessarily echoes back that same shortened name. The
+        // client must still see the name it originally declared.
+        let long_name = "mcp__plugin_project-management_jira-confluence__confluence_download_content_attachments";
+        let short_name = super::super::transform::shorten_tool_name(long_name);
+        assert_ne!(
+            short_name, long_name,
+            "test fixture name must actually need shortening"
+        );
+
+        let mock_body = format!(
+            r#"{{"name":"{short_name}","toolUseId":"tc1","input":"{{}}"}}{{"stop":true}}{{"contextUsagePercentage":10}}"#
+        );
+        let server = spawn_kiro_mock(vec![Script::ok(&mock_body)], None);
+        let (client, _tmp) = test_client("tok", "us-east-1", Some("arn:test"));
+        let mut req = sample_request();
+        req.extra.insert(
+            "tools".to_string(),
+            json!([{"name": long_name, "description": "d", "input_schema": {}}]),
+        );
+
+        let (result, sse) = run_simple(&server, &client, &req).await;
+
+        result.expect("tool-use stream should succeed");
+        let start = find_frame(&sse, "content_block_start").expect("a content block was started");
+        assert_eq!(
+            start["content_block"]["name"], long_name,
+            "client must see the original name, never the shortened one sent to Kiro"
+        );
     }
 
     // ==================================================================

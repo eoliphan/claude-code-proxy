@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 
 use super::kiro_credentials::{KiroAuthMethod, KiroCredentials};
 
-const OIDC_USER_AGENT: &str = "pi-cli";
+const OIDC_USER_AGENT: &str = "claude-code-proxy";
 
 /// Buffer subtracted from the real AWS/Kiro-reported expiry when computing
 /// `KiroCredentials::expires` for tokens this module refreshes directly.

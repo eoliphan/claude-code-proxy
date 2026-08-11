@@ -73,11 +73,15 @@
 //! leading history entry (`sanitize_history::is_leading_invalid`) and there
 //! is no later re-sanitization pass to catch it once it's added this late.
 
+use std::collections::HashMap;
+
 use serde::Serialize;
 use serde_json::Value;
 
 use crate::anthropic::schema::{Message, MessagesRequest};
-use crate::providers::translate_shared::{ImageSource, flatten_system_text, read_effort};
+use crate::providers::translate_shared::{
+    ContentBlock, ImageSource, flatten_system_text, normalize_content, read_effort,
+};
 
 use super::history::{
     HISTORY_LIMIT_CONTEXT_WINDOW, add_placeholder_tools, dynamic_history_limit, truncate_history,
@@ -89,8 +93,48 @@ use super::transform::{
     KiroUserInputMessage, KiroUserInputMessageContext, TOOL_RESULTS_PROVIDED,
     assistant_has_tool_use, assistant_message_contribution, convert_images_to_kiro,
     convert_tools_to_kiro, extract_images, get_content_text, message_has_tool_result,
-    user_message_contribution,
+    shorten_tool_name, user_message_contribution,
 };
+
+/// Reverse lookup (shortened name -> original name) for every tool name
+/// that could ever be declared to Kiro for this request: the client's
+/// declared `tools`, plus every `tool_use` name appearing anywhere in
+/// `req.messages` (history and current turn alike — a name referenced only
+/// in history can still end up declared via `add_placeholder_tools`, and
+/// Kiro could call it again). Built independently of `build_kiro_request`
+/// itself, from the raw request only, since [`shorten_tool_name`] is a pure
+/// function and every embedding site already applies it consistently —
+/// this only needs to recover the *original* name for names that changed.
+///
+/// Only entries whose name was actually shortened are present; a name
+/// within Kiro's limit never needs a reverse lookup.
+pub fn build_tool_name_reverse_map(req: &MessagesRequest) -> HashMap<String, String> {
+    let mut map = HashMap::new();
+    let mut record = |name: &str| {
+        let short = shorten_tool_name(name);
+        if short != name {
+            map.insert(short, name.to_string());
+        }
+    };
+
+    if let Some(tools) = req.extra.get("tools").and_then(Value::as_array) {
+        for tool in tools {
+            if let Some(name) = tool.get("name").and_then(Value::as_str) {
+                record(name);
+            }
+        }
+    }
+
+    for message in &req.messages {
+        for block in normalize_content(&message.content, Value::Null) {
+            if let ContentBlock::ToolUse { name, .. } = block {
+                record(&name);
+            }
+        }
+    }
+
+    map
+}
 
 #[derive(Debug, Clone, Serialize)]
 pub struct KiroRequest {
@@ -537,6 +581,51 @@ mod tests {
             thinking_budget: None,
             profile_arn: None,
         }
+    }
+
+    // ---- build_tool_name_reverse_map (Kiro's 64-char tool-name limit) ----
+
+    #[test]
+    fn reverse_map_is_empty_when_no_tool_name_exceeds_the_limit() {
+        let mut request = req(vec![user(Value::String("hi".to_string()))]);
+        request.extra.insert(
+            "tools".to_string(),
+            json!([{"name": "Read", "description": "d", "input_schema": {}}]),
+        );
+        assert!(build_tool_name_reverse_map(&request).is_empty());
+    }
+
+    #[test]
+    fn reverse_map_covers_a_long_declared_tool_name() {
+        let long_name = "mcp__plugin_project-management_jira-confluence__confluence_download_content_attachments";
+        let mut request = req(vec![user(Value::String("hi".to_string()))]);
+        request.extra.insert(
+            "tools".to_string(),
+            json!([{"name": long_name, "description": "d", "input_schema": {}}]),
+        );
+        let map = build_tool_name_reverse_map(&request);
+        let short = shorten_tool_name(long_name);
+        assert_eq!(map.get(&short), Some(&long_name.to_string()));
+    }
+
+    #[test]
+    fn reverse_map_covers_a_long_tool_use_name_from_history_even_when_not_currently_declared() {
+        // A tool called in a past turn can drop out of the client's current
+        // `tools` list (e.g. after truncation) but still be reachable via
+        // `add_placeholder_tools` -- the reverse map must cover it too, or a
+        // repeat call to it can never be translated back for the client.
+        let long_name = "mcp__plugin_project-management_jira-confluence__confluence_download_content_attachments";
+        let request = req(vec![
+            user(Value::String("do the thing".to_string())),
+            assistant(json!([tool_use_block("t1", long_name, json!({}))])),
+            user(json!([tool_result_block(
+                "t1",
+                Value::String("done".to_string())
+            )])),
+        ]);
+        let map = build_tool_name_reverse_map(&request);
+        let short = shorten_tool_name(long_name);
+        assert_eq!(map.get(&short), Some(&long_name.to_string()));
     }
 
     // ---- single-turn / multi-turn ----

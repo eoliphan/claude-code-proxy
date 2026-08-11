@@ -118,25 +118,30 @@ fn read_credentials_from_db(
     })
 }
 
+/// Candidate keys for an IDC token in kiro-cli's `auth_kv` table, tried in
+/// order. Real installed kiro-cli builds have been observed storing it
+/// under `codewhisperer:odic:token` rather than `kirocli:odic:token`;
+/// `save_kiro_cli_credentials_for` already writes back to whichever of
+/// these rows exists, so the read side needs the same two candidates or a
+/// login stored under the `codewhisperer:` alias is invisible to reuse.
+const IDC_TOKEN_KEYS: &[&str] = &["kirocli:odic:token", "codewhisperer:odic:token"];
+
 pub fn get_kiro_cli_credentials_for(
     deps: &DirResolverEnv,
     allow_expired: bool,
 ) -> Option<KiroCredentials> {
     let db_path = kiro_cli_db_path_for(deps)?;
-    read_credentials_from_db(
-        &db_path,
-        "kirocli:odic:token",
-        KiroAuthMethod::Idc,
-        allow_expired,
-    )
-    .or_else(|| {
-        read_credentials_from_db(
-            &db_path,
-            "kirocli:social:token",
-            KiroAuthMethod::Desktop,
-            allow_expired,
-        )
-    })
+    IDC_TOKEN_KEYS
+        .iter()
+        .find_map(|key| read_credentials_from_db(&db_path, key, KiroAuthMethod::Idc, allow_expired))
+        .or_else(|| {
+            read_credentials_from_db(
+                &db_path,
+                "kirocli:social:token",
+                KiroAuthMethod::Desktop,
+                allow_expired,
+            )
+        })
 }
 
 pub fn get_kiro_cli_credentials() -> Option<KiroCredentials> {
@@ -184,7 +189,7 @@ pub fn save_kiro_cli_credentials_for(deps: &DirResolverEnv, creds: &KiroCredenti
         Err(_) => return,
     };
     let keys: &[&str] = match creds.auth_method {
-        KiroAuthMethod::Idc => &["kirocli:odic:token", "codewhisperer:odic:token"],
+        KiroAuthMethod::Idc => IDC_TOKEN_KEYS,
         KiroAuthMethod::Desktop => &["kirocli:social:token"],
     };
     for key in keys {
@@ -308,6 +313,49 @@ mod tests {
                 .unwrap();
         assert_eq!(creds.access, "at");
         assert_eq!(creds.client_id, "cid");
+        assert_eq!(creds.auth_method, KiroAuthMethod::Idc);
+    }
+
+    #[test]
+    fn get_kiro_cli_credentials_finds_a_token_stored_under_the_codewhisperer_key_alias() {
+        // Real installed kiro-cli builds have been observed storing the IDC
+        // token under `codewhisperer:odic:token` rather than
+        // `kirocli:odic:token` -- `save_kiro_cli_credentials_for` already
+        // knows both keys (it updates whichever row exists), but the read
+        // path used by `bootstrap_login`'s kiro-cli-reuse step only ever
+        // checked the `kirocli:` key, so a real kiro-cli login under this
+        // naming was silently invisible to reuse and fell through to the
+        // device-code flow every time.
+        let tmp = TempDir::new().unwrap();
+        let db_path = make_kiro_cli_db(tmp.path());
+        let deps = crate::paths::DirResolverEnv {
+            platform: "linux".to_string(),
+            env: Default::default(),
+            home: tmp.path().to_string_lossy().to_string(),
+        };
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute(
+            "INSERT INTO auth_kv (key, value) VALUES (?1, ?2)",
+            rusqlite::params![
+                "codewhisperer:odic:token",
+                r#"{"access_token":"cw-access","refresh_token":"cw-refresh","expires_at":"2099-01-01T00:00:00.000Z","region":"us-east-1"}"#
+            ],
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO auth_kv (key, value) VALUES (?1, ?2)",
+            rusqlite::params![
+                "codewhisperer:odic:device-registration",
+                r#"{"client_id":"cw-cid","client_secret":"cw-csec"}"#
+            ],
+        )
+        .unwrap();
+        // No "kirocli:odic:token" row exists at all.
+
+        let creds = get_kiro_cli_credentials_for(&deps, false)
+            .expect("credential stored under the codewhisperer: alias must still be found");
+        assert_eq!(creds.access, "cw-access");
+        assert_eq!(creds.refresh, "cw-refresh");
+        assert_eq!(creds.client_id, "cw-cid");
         assert_eq!(creds.auth_method, KiroAuthMethod::Idc);
     }
 

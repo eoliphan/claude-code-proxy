@@ -44,6 +44,7 @@
 
 use serde::Serialize;
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 
 use crate::anthropic::schema::Message;
 use crate::providers::translate_shared::{
@@ -285,6 +286,39 @@ pub fn convert_images_to_kiro(images: &[ImageSource]) -> Vec<KiroImage> {
         .collect()
 }
 
+/// Kiro (AWS Bedrock/CodeWhisperer) rejects the *entire* request if any
+/// declared or referenced tool name exceeds this length. Confirmed
+/// empirically: 64 chars succeeds, 65 fails with `REQUEST_BODY_INVALID`.
+pub const MAX_TOOL_NAME_LEN: usize = 64;
+
+/// Deterministically shortens `name` to fit Kiro's [`MAX_TOOL_NAME_LEN`]
+/// limit. Names already within the limit are returned unchanged. Longer
+/// names (routine for Claude Code's `mcp__plugin_<plugin>_<server>__<tool>`
+/// naming, which regularly exceeds 64 chars) become the first 55 characters
+/// plus `_` plus an 8-hex-char SHA-256 digest of the *full* original name —
+/// a plain prefix truncation alone is not safe here: real MCP tool families
+/// (e.g. `..._jira_get_issue`, `..._jira_get_issue_dates`,
+/// `..._jira_get_issue_development_info`) routinely share a 55+ character
+/// common prefix and would otherwise collide.
+///
+/// Being a pure function of `name` alone (no shared state), every call site
+/// that embeds a tool name into the outgoing Kiro request — tool
+/// declarations and every `tool_use` name folded into history — agrees on
+/// the same shortened form without needing to share a map. Only the reverse
+/// direction (translating Kiro's response back to Claude Code) needs a
+/// lookup table; see `request::build_tool_name_reverse_map`.
+pub fn shorten_tool_name(name: &str) -> String {
+    if name.chars().count() <= MAX_TOOL_NAME_LEN {
+        return name.to_string();
+    }
+    let digest = Sha256::digest(name.as_bytes());
+    let suffix = format!("{digest:x}");
+    let suffix = &suffix[..8];
+    let prefix_len = MAX_TOOL_NAME_LEN - 1 - suffix.len();
+    let prefix: String = name.chars().take(prefix_len).collect();
+    format!("{prefix}_{suffix}")
+}
+
 /// Port of `convertToolsToKiro`. `tools` are raw Anthropic tool
 /// definitions (`{name, description, input_schema}`), not `pi`'s typed
 /// `Tool` (`parameters` field) — the note-1-style field-name translation.
@@ -295,8 +329,8 @@ pub fn convert_tools_to_kiro(tools: &[Value]) -> Vec<KiroToolSpec> {
             let name = tool
                 .get("name")
                 .and_then(|v| v.as_str())
-                .unwrap_or_default()
-                .to_string();
+                .unwrap_or_default();
+            let name = shorten_tool_name(name);
             let description = tool
                 .get("description")
                 .and_then(|v| v.as_str())
@@ -544,7 +578,10 @@ pub(crate) fn assistant_message_contribution(content: &Value) -> (String, Vec<Ki
             }
             ContentBlock::ToolUse { id, name, input } => {
                 arm_tool_uses.push(KiroToolUse {
-                    name,
+                    // Must match whatever `convert_tools_to_kiro` declares
+                    // this tool as, so a resumed/history tool_use always
+                    // references a name Kiro actually knows about.
+                    name: shorten_tool_name(&name),
                     tool_use_id: id,
                     input,
                 });
@@ -762,6 +799,77 @@ mod tests {
             kiro[0].tool_specification.input_schema.json,
             json!({"type": "object", "properties": {"q": {"type": "string"}}})
         );
+    }
+
+    // ---- shorten_tool_name / long tool names (Kiro's 64-char limit) ----
+
+    #[test]
+    fn shorten_tool_name_leaves_short_names_unchanged() {
+        assert_eq!(shorten_tool_name("Read"), "Read");
+    }
+
+    #[test]
+    fn shorten_tool_name_leaves_exactly_64_chars_unchanged() {
+        let name = "a".repeat(64);
+        assert_eq!(shorten_tool_name(&name), name);
+    }
+
+    #[test]
+    fn shorten_tool_name_shortens_65_chars_to_exactly_64() {
+        let name = "a".repeat(65);
+        let short = shorten_tool_name(&name);
+        assert_eq!(short.chars().count(), 64);
+        assert_ne!(short, name);
+    }
+
+    #[test]
+    fn shorten_tool_name_is_deterministic() {
+        let name = "mcp__plugin_project-management_jira-confluence__confluence_download_content_attachments";
+        assert_eq!(shorten_tool_name(name), shorten_tool_name(name));
+    }
+
+    #[test]
+    fn shorten_tool_name_matches_kiros_allowed_pattern() {
+        let name = "mcp__plugin_project-management_jira-confluence__confluence_download_content_attachments";
+        let short = shorten_tool_name(name);
+        assert!(
+            short
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-'),
+            "shortened name {short:?} must match Kiro's ^[a-zA-Z0-9_-]{{1,64}}$ pattern"
+        );
+    }
+
+    #[test]
+    fn shorten_tool_name_disambiguates_real_colliding_mcp_tool_family() {
+        // Real names observed in a live session: all three share the same
+        // 64+ character prefix, so plain truncation would collide them.
+        let a = shorten_tool_name("mcp__plugin_project-management_jira-confluence__jira_get_issue");
+        let b = shorten_tool_name(
+            "mcp__plugin_project-management_jira-confluence__jira_get_issue_dates",
+        );
+        let c = shorten_tool_name(
+            "mcp__plugin_project-management_jira-confluence__jira_get_issue_development_info",
+        );
+        assert_ne!(a, b);
+        assert_ne!(b, c);
+        assert_ne!(a, c);
+    }
+
+    #[test]
+    fn convert_tools_to_kiro_shortens_a_name_over_64_chars() {
+        let long_name = "mcp__plugin_project-management_jira-confluence__confluence_download_content_attachments";
+        let tools = vec![json!({
+            "name": long_name,
+            "description": "download attachment",
+            "input_schema": {"type": "object", "properties": {}},
+        })];
+        let kiro = convert_tools_to_kiro(&tools);
+        assert_eq!(
+            kiro[0].tool_specification.name,
+            shorten_tool_name(long_name)
+        );
+        assert_eq!(kiro[0].tool_specification.name.chars().count(), 64);
     }
 
     // ---- get_content_text / extract_images (note 1 translation) ----
