@@ -41,6 +41,11 @@ enum Commands {
     /// Open the monitor TUI with mock data and no proxy server
     #[command(hide = true)]
     Demo,
+    /// Attach the monitor TUI to an already-running proxy
+    Attach {
+        #[arg(long)]
+        port: Option<u16>,
+    },
     /// List supported provider models
     Models {
         #[arg(long)]
@@ -104,11 +109,16 @@ fn main() -> Result<()> {
             match select_serve_mode(std::io::stdout().is_terminal(), no_monitor) {
                 ServeMode::Plain => {
                     print_server_banner(&bind_address, effective_port, &registry);
+                    // Tracking always runs, even without a TUI attached at
+                    // startup, so `claude-code-proxy attach` has something
+                    // to connect to later. `--no-monitor` only skips
+                    // rendering, never skips recording.
+                    let monitor = MonitorHandle::default();
                     runtime
                         .block_on(server::serve(ServerConfig {
                             bind_address,
                             port: effective_port,
-                            monitor: None,
+                            monitor: Some(monitor),
                         }))
                         .map_err(|err| anyhow::anyhow!(err))
                 }
@@ -156,6 +166,23 @@ fn main() -> Result<()> {
         Commands::Demo => {
             let registry = Registry::with_default_alias();
             tui::run_mock_monitor(config::port(), &registry)
+        }
+        Commands::Attach { port } => {
+            let bind_address = config::bind_address();
+            let effective_port = port.unwrap_or_else(config::port);
+            let base_url = listen_url(&bind_address, effective_port);
+            let registry = Registry::with_default_alias();
+            tui::run_attached_monitor(
+                &base_url,
+                MonitorUiConfig {
+                    listen_url: base_url.clone(),
+                    port: effective_port,
+                    registry: &registry,
+                    shutdown: None,
+                    shutdown_complete: None,
+                },
+            )
+            .map(|_| ())
         }
         Commands::Models { full } => {
             print_models(&Registry::with_default_alias(), full);

@@ -5,6 +5,8 @@ use std::{
     time::{Duration, Instant, SystemTime},
 };
 
+use serde::{Deserialize, Serialize};
+
 mod mock;
 
 pub use mock::{MockMonitor, mock_state};
@@ -12,7 +14,7 @@ pub use mock::{MockMonitor, mock_state};
 const DEFAULT_RECENT_LIMIT: usize = 200;
 pub const SESSION_TOKEN_BUCKET_SECS: u64 = 10;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum EndpointKind {
     Messages,
     CountTokens,
@@ -35,7 +37,7 @@ impl EndpointKind {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RequestStatus {
     Started,
     ProviderSelected,
@@ -1070,6 +1072,305 @@ pub fn usage_from_anthropic_sse(bytes: &[u8]) -> (Option<u64>, Option<u64>) {
     (input_tokens, output_tokens)
 }
 
+// ---- Wire-format snapshot DTOs, for `GET /_monitor/snapshot` (used by `attach`) ----
+//
+// `MonitorState` and friends carry `std::time::Instant` fields for
+// monotonic-clock precision within this process; `Instant` cannot be
+// serialized or reconstructed across a process boundary by definition (it
+// has no wall-clock meaning). These DTOs are the wire format: `SystemTime`
+// becomes epoch milliseconds, `Duration` becomes milliseconds, and
+// `ActiveRequest::started_instant` becomes a pre-computed elapsed-
+// milliseconds value on the way out, reconstructed into a *fresh* `Instant`
+// (offset backward by that same elapsed duration) on the way back in --
+// forward-monotonic from that point on, which is all the read-only
+// rendering path in `tui.rs` needs. `generation_started_instant` is
+// dropped entirely on reconstruction: every read site of that field is
+// `MonitorStore`'s own event-application logic, which a deserialized
+// snapshot never runs (confirmed by grep before writing this).
+
+fn system_time_to_millis(time: SystemTime) -> u64 {
+    time.duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or(Duration::ZERO)
+        .as_millis() as u64
+}
+
+fn millis_to_system_time(millis: u64) -> SystemTime {
+    std::time::UNIX_EPOCH + Duration::from_millis(millis)
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MonitorSnapshotDto {
+    pub started_at_ms: u64,
+    pub sessions: Vec<SessionSummaryDto>,
+    pub active: Vec<ActiveRequestDto>,
+    pub recent: Vec<CompletedRequestDto>,
+}
+
+impl From<&MonitorState> for MonitorSnapshotDto {
+    fn from(state: &MonitorState) -> Self {
+        Self {
+            started_at_ms: system_time_to_millis(state.started_at),
+            sessions: state.sessions.iter().map(SessionSummaryDto::from).collect(),
+            active: state.active.iter().map(ActiveRequestDto::from).collect(),
+            recent: state.recent.iter().map(CompletedRequestDto::from).collect(),
+        }
+    }
+}
+
+impl From<MonitorSnapshotDto> for MonitorState {
+    fn from(dto: MonitorSnapshotDto) -> Self {
+        Self {
+            started_at: millis_to_system_time(dto.started_at_ms),
+            sessions: dto.sessions.into_iter().map(SessionSummary::from).collect(),
+            active: dto.active.into_iter().map(ActiveRequest::from).collect(),
+            recent: dto.recent.into_iter().map(CompletedRequest::from).collect(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionSummaryDto {
+    pub session_id: Option<String>,
+    pub project: Option<String>,
+    pub active_count: usize,
+    pub request_count: usize,
+    pub failure_count: usize,
+    pub provider: Option<String>,
+    pub model: Option<String>,
+    pub effort: Option<String>,
+    pub last_seen_ms: u64,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub output_token_samples: Vec<(u64, u64)>,
+    pub rate_output_tokens: u64,
+    pub generation_duration_ms: u64,
+    pub last_status: String,
+}
+
+impl From<&SessionSummary> for SessionSummaryDto {
+    fn from(s: &SessionSummary) -> Self {
+        Self {
+            session_id: s.session_id.clone(),
+            project: s.project.clone(),
+            active_count: s.active_count,
+            request_count: s.request_count,
+            failure_count: s.failure_count,
+            provider: s.provider.clone(),
+            model: s.model.clone(),
+            effort: s.effort.clone(),
+            last_seen_ms: system_time_to_millis(s.last_seen),
+            input_tokens: s.input_tokens,
+            output_tokens: s.output_tokens,
+            output_token_samples: s
+                .output_token_samples
+                .iter()
+                .map(|(t, v)| (system_time_to_millis(*t), *v))
+                .collect(),
+            rate_output_tokens: s.rate_output_tokens,
+            generation_duration_ms: s.generation_duration.as_millis() as u64,
+            last_status: s.last_status.clone(),
+        }
+    }
+}
+
+impl From<SessionSummaryDto> for SessionSummary {
+    fn from(dto: SessionSummaryDto) -> Self {
+        Self {
+            session_id: dto.session_id,
+            project: dto.project,
+            active_count: dto.active_count,
+            request_count: dto.request_count,
+            failure_count: dto.failure_count,
+            provider: dto.provider,
+            model: dto.model,
+            effort: dto.effort,
+            last_seen: millis_to_system_time(dto.last_seen_ms),
+            input_tokens: dto.input_tokens,
+            output_tokens: dto.output_tokens,
+            output_token_samples: dto
+                .output_token_samples
+                .into_iter()
+                .map(|(t, v)| (millis_to_system_time(t), v))
+                .collect(),
+            rate_output_tokens: dto.rate_output_tokens,
+            generation_duration: Duration::from_millis(dto.generation_duration_ms),
+            last_status: dto.last_status,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ActiveRequestDto {
+    pub request_id: String,
+    pub session_id: Option<String>,
+    pub session_seq: Option<u64>,
+    pub project: Option<String>,
+    pub provider: Option<String>,
+    pub model: Option<String>,
+    pub effort: Option<String>,
+    pub endpoint: EndpointKind,
+    pub started_at_ms: u64,
+    pub elapsed_ms: u64,
+    pub generation_started_at_ms: Option<u64>,
+    pub generation_initial_output_tokens: u64,
+    pub generation_finished_at_ms: Option<u64>,
+    pub generation_duration_ms: Option<u64>,
+    pub status: RequestStatus,
+    pub streamed_bytes: u64,
+    pub stream_chunks: u64,
+    pub input_tokens: Option<u64>,
+    pub output_tokens: Option<u64>,
+    pub error: Option<String>,
+    pub traffic_capture_path: Option<PathBuf>,
+}
+
+impl From<&ActiveRequest> for ActiveRequestDto {
+    fn from(r: &ActiveRequest) -> Self {
+        Self {
+            request_id: r.request_id.clone(),
+            session_id: r.session_id.clone(),
+            session_seq: r.session_seq,
+            project: r.project.clone(),
+            provider: r.provider.clone(),
+            model: r.model.clone(),
+            effort: r.effort.clone(),
+            endpoint: r.endpoint,
+            started_at_ms: system_time_to_millis(r.started_at),
+            elapsed_ms: r.elapsed().as_millis() as u64,
+            generation_started_at_ms: r.generation_started_at.map(system_time_to_millis),
+            generation_initial_output_tokens: r.generation_initial_output_tokens,
+            generation_finished_at_ms: r.generation_finished_at.map(system_time_to_millis),
+            generation_duration_ms: r.generation_duration.map(|d| d.as_millis() as u64),
+            status: r.status.clone(),
+            streamed_bytes: r.streamed_bytes,
+            stream_chunks: r.stream_chunks,
+            input_tokens: r.input_tokens,
+            output_tokens: r.output_tokens,
+            error: r.error.clone(),
+            traffic_capture_path: r.traffic_capture_path.clone(),
+        }
+    }
+}
+
+impl From<ActiveRequestDto> for ActiveRequest {
+    fn from(dto: ActiveRequestDto) -> Self {
+        Self {
+            request_id: dto.request_id,
+            session_id: dto.session_id,
+            session_seq: dto.session_seq,
+            project: dto.project,
+            provider: dto.provider,
+            model: dto.model,
+            effort: dto.effort,
+            endpoint: dto.endpoint,
+            started_at: millis_to_system_time(dto.started_at_ms),
+            started_instant: Instant::now()
+                .checked_sub(Duration::from_millis(dto.elapsed_ms))
+                .unwrap_or_else(Instant::now),
+            generation_started_at: dto.generation_started_at_ms.map(millis_to_system_time),
+            generation_started_instant: None,
+            generation_initial_output_tokens: dto.generation_initial_output_tokens,
+            generation_finished_at: dto.generation_finished_at_ms.map(millis_to_system_time),
+            generation_duration: dto.generation_duration_ms.map(Duration::from_millis),
+            status: dto.status,
+            streamed_bytes: dto.streamed_bytes,
+            stream_chunks: dto.stream_chunks,
+            input_tokens: dto.input_tokens,
+            output_tokens: dto.output_tokens,
+            error: dto.error,
+            traffic_capture_path: dto.traffic_capture_path,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CompletedRequestDto {
+    pub request_id: String,
+    pub session_id: Option<String>,
+    pub session_seq: Option<u64>,
+    pub project: Option<String>,
+    pub provider: Option<String>,
+    pub model: Option<String>,
+    pub effort: Option<String>,
+    pub endpoint: EndpointKind,
+    pub started_at_ms: u64,
+    pub finished_at_ms: u64,
+    pub generation_started_at_ms: Option<u64>,
+    pub generation_initial_output_tokens: u64,
+    pub generation_finished_at_ms: Option<u64>,
+    pub generation_duration_ms: Option<u64>,
+    pub status: RequestStatus,
+    pub http_status: Option<u16>,
+    pub latency_ms: u64,
+    pub streamed_bytes: u64,
+    pub stream_chunks: u64,
+    pub input_tokens: Option<u64>,
+    pub output_tokens: Option<u64>,
+    pub error: Option<String>,
+    pub traffic_capture_path: Option<PathBuf>,
+}
+
+impl From<&CompletedRequest> for CompletedRequestDto {
+    fn from(r: &CompletedRequest) -> Self {
+        Self {
+            request_id: r.request_id.clone(),
+            session_id: r.session_id.clone(),
+            session_seq: r.session_seq,
+            project: r.project.clone(),
+            provider: r.provider.clone(),
+            model: r.model.clone(),
+            effort: r.effort.clone(),
+            endpoint: r.endpoint,
+            started_at_ms: system_time_to_millis(r.started_at),
+            finished_at_ms: system_time_to_millis(r.finished_at),
+            generation_started_at_ms: r.generation_started_at.map(system_time_to_millis),
+            generation_initial_output_tokens: r.generation_initial_output_tokens,
+            generation_finished_at_ms: r.generation_finished_at.map(system_time_to_millis),
+            generation_duration_ms: r.generation_duration.map(|d| d.as_millis() as u64),
+            status: r.status.clone(),
+            http_status: r.http_status,
+            latency_ms: r.latency.as_millis() as u64,
+            streamed_bytes: r.streamed_bytes,
+            stream_chunks: r.stream_chunks,
+            input_tokens: r.input_tokens,
+            output_tokens: r.output_tokens,
+            error: r.error.clone(),
+            traffic_capture_path: r.traffic_capture_path.clone(),
+        }
+    }
+}
+
+impl From<CompletedRequestDto> for CompletedRequest {
+    fn from(dto: CompletedRequestDto) -> Self {
+        Self {
+            request_id: dto.request_id,
+            session_id: dto.session_id,
+            session_seq: dto.session_seq,
+            project: dto.project,
+            provider: dto.provider,
+            model: dto.model,
+            effort: dto.effort,
+            endpoint: dto.endpoint,
+            started_at: millis_to_system_time(dto.started_at_ms),
+            finished_at: millis_to_system_time(dto.finished_at_ms),
+            generation_started_at: dto.generation_started_at_ms.map(millis_to_system_time),
+            generation_started_instant: None,
+            generation_initial_output_tokens: dto.generation_initial_output_tokens,
+            generation_finished_at: dto.generation_finished_at_ms.map(millis_to_system_time),
+            generation_duration: dto.generation_duration_ms.map(Duration::from_millis),
+            status: dto.status,
+            http_status: dto.http_status,
+            latency: Duration::from_millis(dto.latency_ms),
+            streamed_bytes: dto.streamed_bytes,
+            stream_chunks: dto.stream_chunks,
+            input_tokens: dto.input_tokens,
+            output_tokens: dto.output_tokens,
+            error: dto.error,
+            traffic_capture_path: dto.traffic_capture_path,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1625,5 +1926,96 @@ data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input
 
         assert_eq!(first, vec!["session-a", "session-b"]);
         assert_eq!(second, first);
+    }
+
+    // ---- MonitorSnapshotDto round-trip (GET /_monitor/snapshot / attach) ----
+
+    fn sample_state_with_active_and_completed() -> MonitorState {
+        let monitor = MonitorHandle::new(10);
+        monitor.request_started(
+            "r-active",
+            Some("s1".to_string()),
+            Some(1),
+            EndpointKind::Messages,
+        );
+        monitor.provider_selected("r-active", "codex", "gpt-5.6-sol", None);
+        monitor.generation_started("r-active");
+        monitor.stream_progress("r-active", 1024, 5, Some(10), Some(20));
+
+        monitor.request_started(
+            "r-done",
+            Some("s1".to_string()),
+            Some(2),
+            EndpointKind::Messages,
+        );
+        monitor.provider_selected("r-done", "codex", "gpt-5.6-sol", None);
+        monitor.generation_started("r-done");
+        monitor.usage_updated("r-done", Some(30), Some(40));
+        monitor.request_completed("r-done", 200, Some(30), Some(40));
+
+        monitor.snapshot()
+    }
+
+    #[test]
+    fn snapshot_dto_round_trips_through_json_preserving_ids_and_counts() {
+        let state = sample_state_with_active_and_completed();
+        let dto = MonitorSnapshotDto::from(&state);
+        let json = serde_json::to_string(&dto).expect("serialize");
+        let decoded: MonitorSnapshotDto = serde_json::from_str(&json).expect("deserialize");
+        let restored = MonitorState::from(decoded);
+
+        assert_eq!(restored.active.len(), 1);
+        assert_eq!(restored.active[0].request_id, "r-active");
+        assert_eq!(restored.active[0].streamed_bytes, 1024);
+        assert_eq!(restored.active[0].output_tokens, Some(20));
+
+        assert_eq!(restored.recent.len(), 1);
+        assert_eq!(restored.recent[0].request_id, "r-done");
+        assert_eq!(restored.recent[0].http_status, Some(200));
+        assert_eq!(restored.recent[0].output_tokens, Some(40));
+
+        assert_eq!(restored.sessions.len(), 1);
+        assert_eq!(restored.sessions[0].session_id.as_deref(), Some("s1"));
+        assert_eq!(restored.sessions[0].request_count, 2);
+    }
+
+    #[test]
+    fn snapshot_dto_round_trip_preserves_a_sane_elapsed_and_rate_for_active_requests() {
+        // `started_instant` cannot cross the wire (Instant has no wall-clock
+        // meaning); the DTO carries a pre-computed `elapsed_ms` instead and
+        // reconstruction rebuilds a *fresh* Instant offset backward by that
+        // duration. `.elapsed()` and `.rate()` must still work sensibly on
+        // the reconstructed value, not panic or report nonsense.
+        let state = sample_state_with_active_and_completed();
+        let dto = MonitorSnapshotDto::from(&state);
+        let restored = MonitorState::from(dto);
+
+        let active = &restored.active[0];
+        // Real elapsed time is a handful of microseconds in this test, but
+        // must never be negative/underflow and must stay small.
+        assert!(active.elapsed() < Duration::from_secs(5));
+        // 20 output tokens over a real (tiny) duration: rate() must not
+        // panic on a near-zero denominator.
+        let _ = active.rate();
+
+        let completed = &restored.recent[0];
+        let _ = completed.rate();
+    }
+
+    #[test]
+    fn snapshot_dto_json_uses_stable_wire_field_names() {
+        // Pins the wire contract: any future `attach` client (including an
+        // upstream one, if this lands there) depends on these exact names.
+        let state = sample_state_with_active_and_completed();
+        let dto = MonitorSnapshotDto::from(&state);
+        let json = serde_json::to_value(&dto).unwrap();
+        assert!(json.get("started_at_ms").is_some());
+        let active = &json["active"][0];
+        assert!(active.get("elapsed_ms").is_some());
+        assert!(active.get("started_at_ms").is_some());
+        assert!(active.get("request_id").is_some());
+        let recent = &json["recent"][0];
+        assert!(recent.get("latency_ms").is_some());
+        assert!(recent.get("finished_at_ms").is_some());
     }
 }

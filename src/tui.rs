@@ -32,8 +32,8 @@ use tokio::sync::oneshot;
 
 use crate::{
     monitor::{
-        ActiveRequest, CompletedRequest, MockMonitor, MonitorHandle, MonitorState,
-        SESSION_TOKEN_BUCKET_SECS, SessionSummary,
+        ActiveRequest, CompletedRequest, MockMonitor, MonitorHandle, MonitorSnapshotDto,
+        MonitorState, SESSION_TOKEN_BUCKET_SECS, SessionSummary,
     },
     paths,
     registry::Registry,
@@ -74,6 +74,62 @@ pub fn run_monitor(
     config: MonitorUiConfig<'_>,
 ) -> Result<MonitorExit, anyhow::Error> {
     run_monitor_loop(|| handle.snapshot(), config, None)
+}
+
+/// Renders the same monitor TUI against an already-running proxy's
+/// `GET /_monitor/snapshot` endpoint instead of an in-process
+/// `MonitorHandle` -- backs `claude-code-proxy attach`. `run_monitor_loop`
+/// already takes its state source as a generic `FnMut() -> MonitorState`
+/// closure (proven by `run_mock_monitor`'s demo-data closure below), so no
+/// rendering code changes at all; this only supplies a different source.
+///
+/// The first fetch is fail-fast: if nothing answers, there is nothing
+/// useful to render, so the error surfaces immediately with a clear
+/// message rather than an empty TUI. Once attached, a transient fetch
+/// failure (a momentarily busy proxy, a dropped connection) reuses the
+/// last known snapshot instead of tearing down the view.
+pub fn run_attached_monitor(
+    base_url: &str,
+    config: MonitorUiConfig<'_>,
+) -> Result<MonitorExit, anyhow::Error> {
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_millis(1500))
+        .build()?;
+    let snapshot_url = format!("{}/_monitor/snapshot", base_url.trim_end_matches('/'));
+
+    let mut last = fetch_monitor_snapshot(&client, &snapshot_url)?;
+
+    run_monitor_loop(
+        move || {
+            if let Ok(state) = fetch_monitor_snapshot(&client, &snapshot_url) {
+                last = state;
+            }
+            last.clone()
+        },
+        config,
+        None,
+    )
+}
+
+fn fetch_monitor_snapshot(
+    client: &reqwest::blocking::Client,
+    url: &str,
+) -> Result<MonitorState, anyhow::Error> {
+    let response = client
+        .get(url)
+        .send()
+        .map_err(|err| anyhow::anyhow!("cannot reach a proxy at {url}: {err}"))?;
+    if response.status() == reqwest::StatusCode::NOT_FOUND {
+        anyhow::bail!(
+            "no monitor is tracked at {url} -- is claude-code-proxy serve running there?"
+        );
+    }
+    let dto: MonitorSnapshotDto = response
+        .error_for_status()
+        .map_err(|err| anyhow::anyhow!("proxy returned an error for {url}: {err}"))?
+        .json()
+        .map_err(|err| anyhow::anyhow!("could not parse monitor snapshot from {url}: {err}"))?;
+    Ok(MonitorState::from(dto))
 }
 
 pub fn run_mock_monitor(port: u16, registry: &Registry) -> Result<(), anyhow::Error> {

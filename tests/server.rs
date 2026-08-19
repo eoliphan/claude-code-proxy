@@ -1272,6 +1272,59 @@ async fn monitor_records_successful_request_events() {
 }
 
 #[tokio::test]
+async fn monitor_snapshot_route_returns_404_when_no_monitor_is_configured() {
+    let app = app(Arc::new(Registry::with_default_alias()));
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/_monitor/snapshot")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn monitor_snapshot_route_returns_the_handles_live_state_as_json() {
+    let monitor = MonitorHandle::new(10);
+    monitor.request_started(
+        "snap-1",
+        Some("snap-session".to_string()),
+        Some(1),
+        claude_code_proxy::monitor::EndpointKind::Messages,
+    );
+    let app = app_with_monitor(
+        Arc::new(Registry::with_default_alias()),
+        Some(monitor.clone()),
+    );
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/_monitor/snapshot")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: Value = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .unwrap();
+    assert_eq!(body["active"][0]["request_id"], "snap-1");
+    assert_eq!(body["active"][0]["session_id"], "snap-session");
+    assert!(body["active"][0]["elapsed_ms"].is_u64());
+}
+
+#[tokio::test]
 async fn monitor_records_invalid_json_failure() {
     let monitor = MonitorHandle::new(10);
     let app = app_with_monitor(
