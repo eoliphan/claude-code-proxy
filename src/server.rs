@@ -1,7 +1,7 @@
 use crate::{
     anthropic::json_error,
     logging::{Logger, REDACT_KEYS, create_logger},
-    monitor::{EndpointKind, MonitorHandle},
+    monitor::{EndpointKind, MonitorHandle, MonitorSnapshotDto},
     openai_compat::{
         MAX_OPENAI_REQUEST_BYTES, OpenAiError, OpenAiSurface,
         request::{extract_model, parse_request},
@@ -259,6 +259,7 @@ pub fn app_with_features(
     });
     let router = Router::new()
         .route("/healthz", get(healthz))
+        .route("/_monitor/snapshot", get(handler_monitor_snapshot))
         .route("/v1/messages", post(handler_messages))
         .route("/v1/messages/count_tokens", post(handler_count_tokens))
         .route("/v1/models", get(handler_models));
@@ -303,6 +304,20 @@ struct AppState {
 
 async fn healthz() -> Json<serde_json::Value> {
     Json(json!({ "ok": true }))
+}
+
+/// Backs `claude-code-proxy attach`: a running proxy always tracks monitor
+/// state (see `ServeMode::Plain` in `main.rs`), even with no TUI rendered
+/// at startup, so this has something to return. Same trust boundary as
+/// every other route here — no new exposure beyond what an unauthenticated
+/// loopback listener already grants.
+async fn handler_monitor_snapshot(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<MonitorSnapshotDto>, StatusCode> {
+    match &state.monitor {
+        Some(monitor) => Ok(Json(MonitorSnapshotDto::from(&monitor.snapshot()))),
+        None => Err(StatusCode::NOT_FOUND),
+    }
 }
 
 #[derive(serde::Deserialize)]
