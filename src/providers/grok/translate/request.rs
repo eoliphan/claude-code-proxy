@@ -5,7 +5,9 @@ use serde_json::Value;
 
 use crate::anthropic::schema::{Message, MessagesRequest};
 use crate::config::GrokToolImageMode;
-use crate::providers::translate_shared::{ImageSource, image_source_to_url, parallel_tool_calls};
+use crate::providers::translate_shared::{
+    ImageSource, image_source_to_url, parallel_tool_calls, read_effort_with_allowed,
+};
 
 #[derive(Debug, Clone, Serialize)]
 pub struct GrokResponsesRequest {
@@ -19,6 +21,8 @@ pub struct GrokResponsesRequest {
     pub tool_choice: Option<GrokToolChoice>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub parallel_tool_calls: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<GrokReasoning>,
     pub store: bool,
     pub stream: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -136,6 +140,11 @@ pub enum GrokToolChoice {
     Function { r#type: String, name: String },
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct GrokReasoning {
+    pub effort: String,
+}
+
 pub fn translate_request(
     req: &MessagesRequest,
     model: String,
@@ -214,6 +223,12 @@ pub fn translate_request_with_options(
     } else {
         parse_tool_choice(req.extra.get("tool_choice"), &mut tools)?
     };
+    let reasoning =
+        read_effort_with_allowed(req, &["none", "low", "medium", "high", "xhigh", "max"])?.map(
+            |effort| GrokReasoning {
+                effort: map_reasoning_effort(effort, &model),
+            },
+        );
     let mut call_ids = HashSet::new();
     let mut input = Vec::new();
     let mut budget = ReattachBudget::new(&req.messages, image_mode);
@@ -227,6 +242,7 @@ pub fn translate_request_with_options(
         tools,
         tool_choice,
         parallel_tool_calls: parallel_tool_calls(req),
+        reasoning,
         store: false,
         stream: true,
         max_output_tokens: req.max_tokens,
@@ -387,6 +403,15 @@ fn requests_web_search(req: &MessagesRequest) -> bool {
     ]
     .iter()
     .any(|phrase| contains_phrase(&text, phrase))
+}
+
+fn map_reasoning_effort(effort: &str, model: &str) -> String {
+    match effort {
+        "none" | "low" | "medium" | "high" => effort.to_string(),
+        "xhigh" | "max" if model == "grok-4.6" => "xhigh".to_string(),
+        "xhigh" | "max" => "high".to_string(),
+        _ => unreachable!("read_effort_with_allowed validates the effort"),
+    }
 }
 
 fn reject_unknown_top_level(req: &MessagesRequest) -> anyhow::Result<()> {
@@ -1296,6 +1321,53 @@ mod tests {
         assert_eq!(value["input"][2]["type"], "function_call_output");
         assert_eq!(value["tool_choice"]["type"], "function");
     }
+    #[test]
+    fn grok_translation_forwards_reasoning_effort() {
+        let cases = [
+            ("grok-4.5", "none", "none"),
+            ("grok-4.5", "low", "low"),
+            ("grok-4.5", "high", "high"),
+            ("grok-4.5", "xhigh", "high"),
+            ("grok-4.5", "max", "high"),
+            ("grok-4.6", "xhigh", "xhigh"),
+            ("grok-4.6", "max", "xhigh"),
+        ];
+        for (model, requested, expected) in cases {
+            let request: MessagesRequest = serde_json::from_value(serde_json::json!({
+                "model": model,
+                "messages": [{"role":"user","content":"hello"}],
+                "output_config": {"effort": requested}
+            }))
+            .unwrap();
+            let value =
+                serde_json::to_value(translate_request(&request, model.into()).unwrap()).unwrap();
+            assert_eq!(value["reasoning"]["effort"], expected);
+        }
+    }
+
+    #[test]
+    fn grok_translation_omits_reasoning_without_effort() {
+        let request: MessagesRequest = serde_json::from_value(serde_json::json!({
+            "model":"grok-4.5",
+            "messages":[{"role":"user","content":"hello"}]
+        }))
+        .unwrap();
+        let value =
+            serde_json::to_value(translate_request(&request, "grok-4.5".into()).unwrap()).unwrap();
+        assert!(value.get("reasoning").is_none());
+    }
+
+    #[test]
+    fn grok_translation_rejects_unknown_reasoning_effort() {
+        let request: MessagesRequest = serde_json::from_value(serde_json::json!({
+            "model":"grok-4.5",
+            "messages":[{"role":"user","content":"hello"}],
+            "output_config": {"effort": "invalid"}
+        }))
+        .unwrap();
+        assert!(translate_request(&request, "grok-4.5".into()).is_err());
+    }
+
     #[test]
     fn grok_translation_maps_claude_web_search_to_hosted_web_search() {
         let request: MessagesRequest = serde_json::from_value(serde_json::json!({
