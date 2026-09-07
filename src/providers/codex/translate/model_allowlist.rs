@@ -1,6 +1,6 @@
 use std::collections::HashSet;
 
-use crate::config;
+use crate::{config, registry::is_fable_alias};
 
 use super::request::ServiceTier;
 
@@ -28,9 +28,18 @@ pub const MODEL_ALIASES: &[(&str, &str)] = &[
     ("claude-opus-4-7", "gpt-5.6-sol"),
     ("claude-opus-4-8", "gpt-5.6-sol"),
     ("claude-opus-5", "gpt-5.6-sol"),
-    ("fable", "gpt-5.6-sol"),
-    ("claude-fable-5", "gpt-5.6-sol"),
 ];
+
+pub fn resolve_model_alias(model: &str) -> Option<&'static str> {
+    if is_fable_alias(model) {
+        return Some("gpt-6-astra");
+    }
+
+    MODEL_ALIASES
+        .iter()
+        .find(|(alias, _)| *alias == model)
+        .map(|(_, target)| *target)
+}
 
 #[derive(Debug, Clone)]
 pub struct ResolvedModel {
@@ -66,11 +75,7 @@ pub fn resolve_model_request_with_config_override(
     model: &str,
     apply_config_override: bool,
 ) -> ResolvedModel {
-    let alias = MODEL_ALIASES
-        .iter()
-        .find(|(alias, _)| *alias == model)
-        .map(|(_, target)| *target)
-        .unwrap_or(model);
+    let alias = resolve_model_alias(model).unwrap_or(model);
 
     let requested = resolve_fast_model_alias(alias);
 
@@ -118,10 +123,7 @@ pub fn assert_allowed_model(model: &str) -> Result<(), ModelNotAllowedError> {
 }
 
 pub fn uses_responses_lite(model: &str) -> bool {
-    matches!(
-        model,
-        "gpt-5.6-luna" | "gpt-5.6-sol" | "gpt-5.6-terra" | "gpt-6-astra"
-    )
+    matches!(model, "gpt-5.6-luna" | "gpt-5.6-sol" | "gpt-5.6-terra")
 }
 
 /// `gpt-5.6-luna` exists only behind the Responses Lite lane; the full
@@ -144,7 +146,7 @@ pub fn is_valid_model_for_codex(model: &str) -> bool {
     if fast_set.contains(model) {
         return true;
     }
-    MODEL_ALIASES.iter().any(|(alias, _)| *alias == model)
+    resolve_model_alias(model).is_some()
 }
 
 #[cfg(test)]
@@ -155,6 +157,11 @@ mod tests {
     fn haiku_resolves_to_luna() {
         let r = resolve_model_request("haiku");
         assert_eq!(r.model, "gpt-5.6-luna");
+    }
+
+    #[test]
+    fn astra_uses_full_responses_api() {
+        assert!(!uses_responses_lite("gpt-6-astra"));
     }
 
     #[test]
@@ -192,10 +199,40 @@ mod tests {
     }
 
     #[test]
-    fn fable_5_resolves_to_sol() {
-        for model in ["fable", "claude-fable-5"] {
+    fn fable_family_resolves_to_astra() {
+        for model in [
+            "fable",
+            "claude-fable-5",
+            "claude-fable-5-1",
+            "claude-fable-6-20270101",
+        ] {
             let r = resolve_model_request(model);
-            assert_eq!(r.model, "gpt-5.6-sol");
+            assert_eq!(r.model, "gpt-6-astra");
+        }
+    }
+
+    #[test]
+    fn fable_family_validation_accepts_only_canonical_aliases() {
+        for model in [
+            "fable",
+            "claude-fable-5",
+            "claude-fable-5-1",
+            "claude-fable-6-20270101",
+        ] {
+            assert!(is_valid_model_for_codex(model), "{model} should be valid");
+        }
+
+        for model in [
+            "claude-fable-",
+            "fable-5-1",
+            "fable-fast",
+            "claude-fable-fast",
+            "claude-fable-5-1-fast",
+        ] {
+            assert!(
+                !is_valid_model_for_codex(model),
+                "{model} should be invalid"
+            );
         }
     }
 
@@ -203,6 +240,13 @@ mod tests {
     fn fast_suffix_adds_priority() {
         let r = resolve_model_request("gpt-5.6-sol-fast");
         assert_eq!(r.model, "gpt-5.6-sol");
+        assert_eq!(r.service_tier, Some(ServiceTier::Priority));
+    }
+
+    #[test]
+    fn astra_fast_suffix_adds_priority() {
+        let r = resolve_model_request("gpt-6-astra-fast");
+        assert_eq!(r.model, "gpt-6-astra");
         assert_eq!(r.service_tier, Some(ServiceTier::Priority));
     }
 

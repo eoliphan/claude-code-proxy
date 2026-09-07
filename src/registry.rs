@@ -22,6 +22,7 @@ pub const ANTHROPIC_STYLE_ALIASES: &[&str] = &[
     "claude-opus-5",
     "fable",
     "claude-fable-5",
+    "claude-fable-5-1",
 ];
 
 pub const CURSOR_PREFIXES: &[&str] = &["cursor:", "cursor-plan:", "cursor-ask:"];
@@ -218,8 +219,16 @@ pub fn normalize_incoming_model(model: &str) -> String {
     model.to_string()
 }
 
+pub fn is_fable_alias(model: &str) -> bool {
+    model == "fable"
+        || (!model.ends_with("-fast")
+            && model
+                .strip_prefix("claude-fable-")
+                .is_some_and(|suffix| !suffix.is_empty()))
+}
+
 pub fn is_anthropic_alias(model: &str) -> bool {
-    ANTHROPIC_STYLE_ALIASES.contains(&model)
+    ANTHROPIC_STYLE_ALIASES.contains(&model) || is_fable_alias(model)
 }
 
 pub fn is_cursor_model(model: &str) -> bool {
@@ -402,6 +411,8 @@ mod tests {
             "claude-opus-5",
             "fable",
             "claude-fable-5",
+            "claude-fable-5-1",
+            "claude-fable-6-20270101",
         ] {
             let p = registry.provider_for_model(model, None);
             assert!(p.is_some(), "{model} should route to a provider");

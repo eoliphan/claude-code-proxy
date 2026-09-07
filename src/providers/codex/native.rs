@@ -19,7 +19,7 @@ use crate::traffic::{
 
 use super::client::{CodexError, CodexHttpClient};
 use super::translate::model_allowlist::{
-    ALLOWED_MODELS, MODEL_ALIASES, assert_allowed_model, full_lane_web_search_model,
+    ALLOWED_MODELS, assert_allowed_model, full_lane_web_search_model, resolve_model_alias,
     uses_responses_lite,
 };
 
@@ -144,11 +144,7 @@ fn resolve_native_model(requested: &str) -> (String, bool) {
         Some(base) if ALLOWED_MODELS.contains(&base) => (base, true),
         _ => (requested, false),
     };
-    let model = MODEL_ALIASES
-        .iter()
-        .find(|(alias, _)| *alias == requested)
-        .map(|(_, target)| *target)
-        .unwrap_or(requested);
+    let model = resolve_model_alias(requested).unwrap_or(requested);
     (model.to_string(), priority)
 }
 
@@ -701,6 +697,17 @@ mod tests {
         let resolved = shape_native_request(&mut fast).unwrap();
         assert_eq!(resolved.model, "gpt-5.4");
         assert_eq!(fast["service_tier"], "priority");
+    }
+
+    #[test]
+    fn native_request_resolves_fable_family_to_astra() {
+        for model in ["fable", "claude-fable-5-1", "claude-fable-6-20270101"] {
+            let mut body = request(json!({"model":model,"input":[]}));
+            let resolved = shape_native_request(&mut body).unwrap();
+            assert_eq!(resolved.model, "gpt-6-astra");
+            assert_eq!(body["model"], "gpt-6-astra");
+            assert!(!resolved.use_responses_lite);
+        }
     }
 
     #[test]

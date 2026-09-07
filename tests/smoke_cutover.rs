@@ -66,6 +66,14 @@ impl EnvGuard {
         }
         Self { key, previous }
     }
+
+    fn remove(key: &'static str) -> Self {
+        let previous = std::env::var_os(key);
+        unsafe {
+            std::env::remove_var(key);
+        }
+        Self { key, previous }
+    }
 }
 
 impl Drop for EnvGuard {
@@ -1036,6 +1044,100 @@ async fn smoke_codex_http_messages_uses_mock_upstream() {
 
 #[allow(clippy::await_holding_lock)]
 #[tokio::test]
+async fn smoke_codex_http_messages_routes_fable_family_to_astra() {
+    let _guard = env_lock();
+    let config = TempDir::new().unwrap();
+    write_auth(config.path(), "codex");
+
+    let captured = Arc::new(Mutex::new(Vec::new()));
+    let upstream = spawn_http_upstream({
+        let captured = captured.clone();
+        move |body: Value| {
+            let _ = captured.lock().map(|mut guard| guard.push(body));
+            buffered_success_sse("fable astra ok")
+        }
+    })
+    .await;
+
+    let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
+    let _base_url_env = EnvGuard::set("CCP_CODEX_BASE_URL", &upstream);
+    let _transport_env = EnvGuard::set("CCP_CODEX_TRANSPORT", "http");
+    let _model_env = EnvGuard::set("CCP_CODEX_MODEL", "");
+
+    for model in [
+        "fable",
+        "claude-fable-5",
+        "claude-fable-5-1",
+        "claude-fable-6-20270101",
+    ] {
+        let response = call_messages(model).await;
+        assert_eq!(response.status(), StatusCode::OK, "{model}");
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let value: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["content"][0]["text"], "fable astra ok", "{model}");
+    }
+
+    let sent = captured.lock().unwrap();
+    assert_eq!(sent.len(), 4);
+    for request in sent.iter() {
+        assert_eq!(request["model"], "gpt-6-astra");
+        assert!(request.get("client_metadata").is_none());
+    }
+}
+
+#[allow(clippy::await_holding_lock)]
+#[tokio::test]
+async fn smoke_codex_model_overrides_take_precedence_over_fable_alias() {
+    let _guard = env_lock();
+    let config = TempDir::new().unwrap();
+    write_auth(config.path(), "codex");
+    std::fs::write(
+        config.path().join("config.json"),
+        r#"{"codex":{"model":"gpt-5.4"}}"#,
+    )
+    .unwrap();
+
+    let captured = Arc::new(Mutex::new(Vec::new()));
+    let upstream = spawn_http_upstream({
+        let captured = captured.clone();
+        move |body: Value| {
+            let _ = captured.lock().map(|mut guard| guard.push(body));
+            buffered_success_sse("override ok")
+        }
+    })
+    .await;
+
+    let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
+    let _base_url_env = EnvGuard::set("CCP_CODEX_BASE_URL", &upstream);
+    let _transport_env = EnvGuard::set("CCP_CODEX_TRANSPORT", "http");
+
+    {
+        let _model_env = EnvGuard::remove("CCP_CODEX_MODEL");
+        let response = call_messages("fable").await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let _ = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+    }
+    {
+        let _model_env = EnvGuard::set("CCP_CODEX_MODEL", "gpt-5.5");
+        let response = call_messages("fable").await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let _ = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+    }
+
+    let sent = captured.lock().unwrap();
+    assert_eq!(sent.len(), 2);
+    assert_eq!(sent[0]["model"], "gpt-5.4");
+    assert_eq!(sent[1]["model"], "gpt-5.5");
+}
+
+#[allow(clippy::await_holding_lock)]
+#[tokio::test]
 async fn smoke_codex_native_responses_preserves_parallel_tool_calls() {
     let _guard = env_lock();
     let config = TempDir::new().unwrap();
@@ -1063,6 +1165,36 @@ async fn smoke_codex_native_responses_preserves_parallel_tool_calls() {
     assert_eq!(response.status(), StatusCode::OK);
     let sent = captured.lock().unwrap().clone().unwrap();
     assert_eq!(sent["parallel_tool_calls"], false);
+}
+
+#[allow(clippy::await_holding_lock)]
+#[tokio::test]
+async fn smoke_codex_native_responses_routes_fable_alias_to_astra() {
+    let _guard = env_lock();
+    let config = TempDir::new().unwrap();
+    write_auth(config.path(), "codex");
+
+    let captured = Arc::new(Mutex::new(None));
+    let upstream = spawn_http_upstream({
+        let captured = captured.clone();
+        move |body: Value| {
+            let _ = captured.lock().map(|mut guard| *guard = Some(body));
+            br#"{"id":"resp_1","object":"response","status":"completed","output":[],"usage":{"input_tokens":1,"output_tokens":1}}"#.to_vec()
+        }
+    })
+    .await;
+
+    let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
+    let _base_url_env = EnvGuard::set("CCP_CODEX_BASE_URL", &upstream);
+    let response = call_responses_body(json!({
+        "model":"claude-fable-6-20270101",
+        "input":"hello"
+    }))
+    .await;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let sent = captured.lock().unwrap().clone().unwrap();
+    assert_eq!(sent["model"], "gpt-6-astra");
 }
 
 /// Resets the retry-delay override even when the test panics, so later tests

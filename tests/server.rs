@@ -701,6 +701,43 @@ async fn opus_5_alias_routes_to_provider() {
 }
 
 #[tokio::test]
+async fn fable_family_aliases_route_to_codex() {
+    for model in [
+        "fable",
+        "claude-fable-5",
+        "claude-fable-5-1",
+        "claude-fable-6-20270101",
+    ] {
+        let response =
+            messages_response(app(Arc::new(Registry::new(AliasProvider::Codex))), model).await;
+        assert_ne!(
+            response.status(),
+            StatusCode::BAD_REQUEST,
+            "{model} should route to Codex"
+        );
+    }
+}
+
+#[tokio::test]
+async fn unsupported_fable_forms_are_rejected() {
+    for model in [
+        "claude-fable-",
+        "fable-5-1",
+        "fable-fast",
+        "claude-fable-fast",
+        "claude-fable-5-1-fast",
+    ] {
+        let response =
+            messages_response(app(Arc::new(Registry::new(AliasProvider::Codex))), model).await;
+        assert_eq!(
+            response.status(),
+            StatusCode::BAD_REQUEST,
+            "{model} should remain unsupported"
+        );
+    }
+}
+
+#[tokio::test]
 async fn image_routes_reject_variations_wrong_media_and_oversized_generation() {
     let features = AppFeatures {
         responses_api: false,
@@ -1447,6 +1484,7 @@ async fn monitor_records_unknown_model_failure() {
     let error = state.recent[0].error.as_deref().unwrap_or("");
     assert!(error.starts_with("Unknown model \"not-a-model\""));
     assert!(error.contains("Supported:"));
+    assert!(error.contains("gpt-6-astra"));
 }
 
 async fn get_models(app: axum::Router, uri: &str) -> (StatusCode, Value) {
@@ -1478,6 +1516,8 @@ async fn models_endpoint_lists_supported_models() {
     assert!(!data.is_empty());
     let ids: Vec<&str> = data.iter().map(|m| m["id"].as_str().unwrap()).collect();
     assert!(ids.contains(&"gpt-5.6-sol"));
+    assert!(ids.contains(&"gpt-6-astra"));
+    assert!(ids.contains(&"gpt-6-astra-fast"));
     assert!(ids.contains(&"grok-4.6"));
     for entry in data {
         assert_eq!(entry["type"], "model");
@@ -1505,6 +1545,9 @@ async fn models_endpoint_includes_claude_prefixed_aliases_for_discovery() {
         .collect();
     assert!(ids.iter().any(|id| id.starts_with("claude-")));
     assert!(ids.contains(&"claude-opus-5"));
+    assert!(ids.contains(&"fable"));
+    assert!(ids.contains(&"claude-fable-5"));
+    assert!(ids.contains(&"claude-fable-5-1"));
 }
 
 #[tokio::test]

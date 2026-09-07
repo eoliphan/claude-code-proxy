@@ -83,3 +83,16 @@ ANTHROPIC_SMALL_FAST_MODEL=gpt-5.6-luna[1m] \
 ## Alias routing
 
 `CCP_ALIAS_PROVIDER=kimi` or `"aliasProvider": "kimi"` routes recognized Anthropic-style aliases to Kimi. Accepted values are `codex`, `kimi`, and `kiro`. Explicit provider IDs always use their provider.
+
+When Codex is the alias provider, the common aliases resolve as follows:
+
+| Alias family | Codex model |
+| --- | --- |
+| `haiku` and registered Haiku IDs | `gpt-5.6-luna` |
+| `sonnet` and registered Sonnet IDs | `gpt-5.6-terra` |
+| `opus` and registered Opus IDs | `gpt-5.6-sol` |
+| `fable` and nonempty `claude-fable-*` IDs | `gpt-6-astra` |
+
+The catalog lists `fable`, `claude-fable-5`, and `claude-fable-5-1`. Future nonempty `claude-fable-*` IDs also route to Astra, although they do not appear in the finite catalog. The proxy rejects `fable-*` shorthand and Fable aliases that end in `-fast`. Use `gpt-6-astra-fast` to request Astra with the priority service tier.
+
+`CCP_CODEX_MODEL` or `codex.model` overrides a model selected through an alias.

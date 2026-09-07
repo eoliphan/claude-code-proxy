@@ -5,6 +5,8 @@ description: Release notes for claude-code-proxy.
 
 ## Unreleased
 
+- Codex supports `gpt-6-astra` directly and routes Fable aliases to Astra through
+  the full Responses API.
 - Kiro (AWS CodeWhisperer/Q) joins Codex, Kimi, Grok, OpenCode Go, and
   Cursor Agent as a supported provider. Sign in with an AWS IAM Identity
   Center or Builder ID account, or reuse an existing Kiro IDE or kiro-cli

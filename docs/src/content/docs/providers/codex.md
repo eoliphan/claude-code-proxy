@@ -28,6 +28,8 @@ The proxy owns its tokens and does not read native Codex CLI credentials. It ref
 
 Use `claude-code-proxy models` as the current catalog. Model access depends on your ChatGPT account. A model rejected by the subscription produces the upstream error verbatim.
 
+When Codex is the alias provider, `fable` and supported `claude-fable-*` identifiers resolve to `gpt-6-astra`. Astra uses the full Responses API. Fable aliases that end in `-fast` are unsupported. Use the direct `gpt-6-astra-fast` model ID to request the priority service tier.
+
 Append `-fast` to any registered Codex model to request `service_tier: "priority"`. For example, `gpt-5.6-sol-fast` selects `gpt-5.6-sol` with fast service. `CCP_CODEX_SERVICE_TIER` or `codex.serviceTier` takes precedence.
 
 ## Reasoning
