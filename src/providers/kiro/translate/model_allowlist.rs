@@ -14,7 +14,10 @@ static ALIAS_MAP: Lazy<HashMap<&'static str, &'static str>> = Lazy::new(|| {
     for alias in ["haiku", "claude-haiku-4-5", "claude-haiku-4-5-20251001"] {
         m.insert(alias, "claude-haiku-4-5");
     }
-    for alias in ["sonnet", "claude-sonnet-4-6"] {
+    // claude-sonnet-5 stays on 4.6: Kiro's Sonnet 5 intermittently echoes the
+    // injected <max_thinking_length>/<thinking_length> control tags into its
+    // text output. It is still selectable explicitly as kiro:claude-sonnet-5.
+    for alias in ["sonnet", "claude-sonnet-4-6", "claude-sonnet-5"] {
         m.insert(alias, "claude-sonnet-4-6");
     }
     for alias in ["opus", "claude-opus-4-7", "claude-opus-4-8"] {
@@ -23,7 +26,7 @@ static ALIAS_MAP: Lazy<HashMap<&'static str, &'static str>> = Lazy::new(|| {
     // Kiro serves these exact versions (confirmed by a live
     // ListAvailableModels call), so they map to themselves rather than to
     // the nearest older tier.
-    for alias in ["claude-opus-5-5", "claude-opus-5", "claude-sonnet-5"] {
+    for alias in ["claude-opus-5-5", "claude-opus-5"] {
         m.insert(alias, alias);
     }
     m
@@ -73,10 +76,10 @@ mod tests {
     }
 
     #[test]
-    fn exact_version_aliases_resolve_to_their_real_kiro_models() {
+    fn version_aliases_resolve_to_their_intended_kiro_models() {
         assert_eq!(resolve_model("claude-opus-5-5"), "claude-opus-5-5");
         assert_eq!(resolve_model("claude-opus-5"), "claude-opus-5");
-        assert_eq!(resolve_model("claude-sonnet-5"), "claude-sonnet-5");
+        assert_eq!(resolve_model("claude-sonnet-5"), "claude-sonnet-4-6");
     }
 
     #[test]
