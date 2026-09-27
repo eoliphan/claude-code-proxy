@@ -15,6 +15,9 @@ description: Release notes for claude-code-proxy.
   as the configured `aliasProvider`.
   `claude-code-proxy kiro auth login/device/status/logout` manages
   credentials.
+- Kiro serves Claude Opus 5.5 and Opus 5. With `aliasProvider` set to `kiro`,
+  the `claude-opus-5-5` and `claude-opus-5` aliases resolve to those models.
+  Kiro model discovery now works for IAM Identity Center subscriptions.
 
 ## v0.1.42 (2026-09-23)
 
