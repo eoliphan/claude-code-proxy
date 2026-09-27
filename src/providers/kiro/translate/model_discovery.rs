@@ -32,9 +32,25 @@ use crate::providers::kiro::auth::KiroCredentials;
 
 use super::models::{KIRO_MODELS, dot_to_dash, models_for_region, resolve_api_region};
 
-/// User-Agent this proxy sends on Kiro metadata calls — this proxy's own
-/// identity, not `pi-provider-kiro`'s (which sends `"pi-provider-kiro"`).
-const USER_AGENT: &str = "claude-code-proxy";
+/// Builds a Kiro metadata POST (`ListAvailableModels`,
+/// `ListAvailableProfiles`) with the same identity headers the chat call in
+/// `client.rs` sends. IDC subscriptions reject `ListAvailableModels`
+/// without them (`AccessDeniedException: Your subscription does not support
+/// this application`), which left `MODEL_CACHE` permanently empty and the
+/// static catalog as the only source of truth.
+fn metadata_request(url: &str, target: &'static str, access: &str) -> reqwest::RequestBuilder {
+    use crate::providers::kiro::client::PROXY_USER_AGENT;
+    HTTP_CLIENT
+        .post(url)
+        .header("Content-Type", "application/x-amz-json-1.0")
+        .header("Accept", "application/json")
+        .header("User-Agent", PROXY_USER_AGENT)
+        .header("x-amz-user-agent", PROXY_USER_AGENT)
+        .header("x-amzn-kiro-agent-mode", "vibe")
+        .header("x-amzn-codewhisperer-optout", "true")
+        .header("Authorization", format!("Bearer {access}"))
+        .header("X-Amz-Target", target)
+}
 
 /// A model discovered via `ListAvailableModels`, mapped to this proxy's
 /// dash-form ID and filled in from [`KIRO_MODELS`] template metadata where
@@ -180,18 +196,14 @@ async fn fetch_available_models_impl(
         .unwrap_or_else(|| default_base_url(&api_region));
     let url = format!("{base}/?origin=KIRO_CLI");
 
-    let resp = HTTP_CLIENT
-        .post(&url)
-        .header("Content-Type", "application/x-amz-json-1.0")
-        .header("User-Agent", USER_AGENT)
-        .header("Authorization", format!("Bearer {}", credentials.access))
-        .header(
-            "X-Amz-Target",
-            "AmazonCodeWhispererService.ListAvailableModels",
-        )
-        .json(&serde_json::json!({"origin": "KIRO_CLI"}))
-        .send()
-        .await?;
+    let resp = metadata_request(
+        &url,
+        "AmazonCodeWhispererService.ListAvailableModels",
+        &credentials.access,
+    )
+    .json(&serde_json::json!({"origin": "KIRO_CLI"}))
+    .send()
+    .await?;
 
     if !resp.status().is_success() {
         return Err(anyhow!(
@@ -234,18 +246,14 @@ pub(crate) async fn fetch_available_profile_arn_impl(
         .unwrap_or_else(|| default_base_url(&api_region));
     let url = format!("{base}/");
 
-    let resp = HTTP_CLIENT
-        .post(&url)
-        .header("Content-Type", "application/x-amz-json-1.0")
-        .header("User-Agent", USER_AGENT)
-        .header("Authorization", format!("Bearer {}", credentials.access))
-        .header(
-            "X-Amz-Target",
-            "AmazonCodeWhispererService.ListAvailableProfiles",
-        )
-        .json(&serde_json::json!({}))
-        .send()
-        .await?;
+    let resp = metadata_request(
+        &url,
+        "AmazonCodeWhispererService.ListAvailableProfiles",
+        &credentials.access,
+    )
+    .json(&serde_json::json!({}))
+    .send()
+    .await?;
 
     if !resp.status().is_success() {
         return Err(anyhow!(
@@ -565,6 +573,11 @@ mod tests {
             req.contains("user-agent: claude-code-proxy"),
             "should send this proxy's own identity, not pi-provider-kiro's"
         );
+        // Without the same identity headers the chat call sends, IDC
+        // subscriptions reject ListAvailableModels with AccessDeniedException
+        // ("Your subscription does not support this application").
+        assert!(req.contains("x-amz-user-agent: claude-code-proxy/"));
+        assert!(req.contains("x-amzn-kiro-agent-mode: vibe"));
         assert!(req.contains(r#"{"origin":"KIRO_CLI"}"#));
     }
 

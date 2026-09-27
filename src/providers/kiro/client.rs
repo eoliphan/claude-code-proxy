@@ -38,7 +38,8 @@ use crate::auth::FileAuthStore;
 /// `x-amz-user-agent`. Doesn't need to match `pi-provider-kiro`'s exact
 /// string byte-for-byte — Kiro's backend doesn't appear to validate it
 /// beyond presence.
-const PROXY_USER_AGENT: &str = concat!("claude-code-proxy/", env!("CARGO_PKG_VERSION"), " md/kiro");
+pub(crate) const PROXY_USER_AGENT: &str =
+    concat!("claude-code-proxy/", env!("CARGO_PKG_VERSION"), " md/kiro");
 
 #[derive(Debug)]
 pub struct KiroError {

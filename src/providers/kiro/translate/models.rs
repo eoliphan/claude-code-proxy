@@ -42,6 +42,36 @@ const LARGE_OPUS_FIRST_TOKEN_TIMEOUT_MS: u64 = 180_000;
 /// unavailable, and as the template `first_token_timeout_for` /
 /// `models_for_region` operate over.
 pub const KIRO_MODELS: &[KiroModelMeta] = &[
+    // Limits for the three entries below come from a live
+    // ListAvailableModels call (2026-09-27): 1M input for all three, 128K
+    // output for the Opus tiers and 64K for Sonnet 5.
+    KiroModelMeta {
+        id: "claude-opus-5-5",
+        name: "Claude Opus 5.5",
+        reasoning: true,
+        input_image: true,
+        context_window: 1_000_000,
+        max_tokens: 128_000,
+        first_token_timeout_ms: LARGE_OPUS_FIRST_TOKEN_TIMEOUT_MS,
+    },
+    KiroModelMeta {
+        id: "claude-opus-5",
+        name: "Claude Opus 5",
+        reasoning: true,
+        input_image: true,
+        context_window: 1_000_000,
+        max_tokens: 128_000,
+        first_token_timeout_ms: LARGE_OPUS_FIRST_TOKEN_TIMEOUT_MS,
+    },
+    KiroModelMeta {
+        id: "claude-sonnet-5",
+        name: "Claude Sonnet 5",
+        reasoning: true,
+        input_image: true,
+        context_window: 1_000_000,
+        max_tokens: 64_000,
+        first_token_timeout_ms: DEFAULT_FIRST_TOKEN_TIMEOUT_MS,
+    },
     KiroModelMeta {
         id: "claude-opus-4-8",
         name: "Claude Opus 4.8",
@@ -446,12 +476,29 @@ mod tests {
     }
 
     #[test]
-    fn catalog_has_all_nineteen_models_with_unique_ids() {
-        assert_eq!(KIRO_MODELS.len(), 19);
+    fn catalog_has_all_twenty_two_models_with_unique_ids() {
+        assert_eq!(KIRO_MODELS.len(), 22);
         let mut ids: Vec<&str> = KIRO_MODELS.iter().map(|m| m.id).collect();
         ids.sort_unstable();
         ids.dedup();
-        assert_eq!(ids.len(), 19);
+        assert_eq!(ids.len(), 22);
+    }
+
+    #[test]
+    fn opus_5_family_and_sonnet_5_match_live_listavailablemodels_limits() {
+        // Values from a live ListAvailableModels call (2026-09-27), not
+        // copied from older tiers.
+        let by_id = |id: &str| KIRO_MODELS.iter().find(|m| m.id == id).unwrap();
+        for (id, max_tokens) in [
+            ("claude-opus-5-5", 128_000),
+            ("claude-opus-5", 128_000),
+            ("claude-sonnet-5", 64_000),
+        ] {
+            let m = by_id(id);
+            assert_eq!(m.context_window, 1_000_000, "{id}");
+            assert_eq!(m.max_tokens, max_tokens, "{id}");
+            assert!(m.reasoning, "{id}");
+        }
     }
 
     #[test]
@@ -476,7 +523,7 @@ mod tests {
 
     #[test]
     fn us_east_1_gets_full_catalog() {
-        assert_eq!(models_for_region("us-east-1").len(), 19);
+        assert_eq!(models_for_region("us-east-1").len(), 22);
     }
 
     #[test]
@@ -539,7 +586,7 @@ mod tests {
     #[test]
     fn eu_central_1_exclusion_set_is_exact() {
         let models = models_for_region("eu-central-1");
-        assert_eq!(models.len(), 12);
+        assert_eq!(models.len(), 15);
         for excluded in [
             "deepseek-3-2",
             "kimi-k2-5",
