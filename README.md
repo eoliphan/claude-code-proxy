@@ -54,13 +54,17 @@ Start the proxy in one terminal:
 claude-code-proxy serve
 ```
 
+For a background service, use `claude-code-proxy serve --no-monitor` and attach
+from another terminal with `claude-code-proxy monitor`. Closing an attached
+dashboard leaves the proxy running.
+
 Start Claude Code in another:
 
 ```sh
 ANTHROPIC_BASE_URL=http://127.0.0.1:18765 \
 ANTHROPIC_AUTH_TOKEN=unused \
-ANTHROPIC_MODEL=gpt-5.6-sol[1m] \
-ANTHROPIC_SMALL_FAST_MODEL=gpt-5.6-luna[1m] \
+ANTHROPIC_MODEL=gpt-6-sol[1m] \
+ANTHROPIC_SMALL_FAST_MODEL=gpt-6-luna[1m] \
 CLAUDE_CODE_AUTO_COMPACT_WINDOW=272000 \
 CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 \
 CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK=1 \

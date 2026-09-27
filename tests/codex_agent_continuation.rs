@@ -173,10 +173,15 @@ impl CapturedRequest {
         );
         assert_eq!(
             self.headers
-                .get("session_id")
+                .get("session-id")
                 .and_then(|value| value.to_str().ok()),
             expected_session,
-            "socket {} session_id header",
+            "socket {} session-id header",
+            self.socket_ordinal
+        );
+        assert!(
+            self.headers.get("session_id").is_none(),
+            "socket {} must not send the legacy session_id header",
             self.socket_ordinal
         );
         assert_eq!(
@@ -1496,7 +1501,7 @@ async fn auto_review_with_agent_headers_is_stateless() {
         &classifier,
         &[("developer", review_system), ("user", &review)],
     );
-    assert_eq!(classifier.body["model"], "gpt-5.6-luna");
+    assert_eq!(classifier.body["model"], "gpt-6-luna");
     assert_eq!(first.socket_ordinal, 1);
     assert_eq!(classifier.socket_ordinal, 2);
     assert_delta_input(&second, &a_response, first.socket_ordinal, &a2);

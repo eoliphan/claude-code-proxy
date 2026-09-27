@@ -5,8 +5,8 @@ description: Release notes for claude-code-proxy.
 
 ## Unreleased
 
-- Codex supports `gpt-6-astra` directly and routes Fable aliases to Astra through
-  the full Responses API.
+- Codex routes Fable aliases to GPT-6 Astra through the full Responses API,
+  instead of upstream's GPT-6 Sol routing.
 - Kiro (AWS CodeWhisperer/Q) joins Codex, Kimi, Grok, OpenCode Go, and
   Cursor Agent as a supported provider. Sign in with an AWS IAM Identity
   Center or Builder ID account, or reuse an existing Kiro IDE or kiro-cli
@@ -15,9 +15,100 @@ description: Release notes for claude-code-proxy.
   as the configured `aliasProvider`.
   `claude-code-proxy kiro auth login/device/status/logout` manages
   credentials.
-- `claude-code-proxy attach` views the monitor TUI of an already-running
-  proxy. `--no-monitor` now always tracks request/session state; it only
-  skips rendering the TUI at startup.
+
+## v0.1.42 (2026-09-23)
+
+- Codex users can select GPT-6 Sol and GPT-6 Luna, including their `-fast`
+  priority-tier variants.
+  ([#165](https://github.com/raine/claude-code-proxy/pull/165))
+- Codex now defaults to GPT-6 Sol. Opus and Fable aliases use GPT-6 Sol,
+  Haiku aliases use GPT-6 Luna, and the Claude Opus 5.5 alias is supported.
+  Sonnet remains on GPT-5.6 Terra.
+  ([#165](https://github.com/raine/claude-code-proxy/pull/165))
+- Grok users can select Grok 4.7 with `grok-4.7`.
+  ([#162](https://github.com/raine/claude-code-proxy/pull/162))
+
+## v0.1.41 (2026-09-19)
+
+- Long Codex requests on the HTTP transport no longer hang for minutes and then
+  fail: the proxy waits five minutes for the response headers instead of one,
+  configurable with `CCP_CODEX_HEADER_TIMEOUT_MS` or `codex.headerTimeoutMs`,
+  and a timeout there fails the request once rather than re-sending it.
+  ([#160](https://github.com/raine/claude-code-proxy/pull/160))
+- The installer correctly reports the existing version during upgrades instead
+  of showing it as unknown.
+  ([#157](https://github.com/raine/claude-code-proxy/issues/157))
+- Codex requests use the current session header for cache affinity, improving
+  compatibility with intermediaries that reject the legacy header.
+  ([#156](https://github.com/raine/claude-code-proxy/pull/156))
+
+## v0.1.40 (2026-09-14)
+
+- Attach one or more monitor dashboards to a background proxy with
+  `claude-code-proxy monitor`; dashboards reconnect automatically and detach
+  without stopping the service.
+  ([#134](https://github.com/raine/claude-code-proxy/pull/134))
+- Monitor activity graphs remain accurate across machines with different clocks,
+  and long-running proxies no longer accumulate unbounded monitor history.
+  ([#134](https://github.com/raine/claude-code-proxy/pull/134))
+- Exhausted Codex subscription limits now fail immediately instead of retrying
+  for minutes, while preserving reset details for clients.
+  ([#139](https://github.com/raine/claude-code-proxy/pull/139))
+- HTTP connections honor the platform trust store, `SSL_CERT_FILE`, and
+  `SSL_CERT_DIR`, enabling private certificate authorities and TLS-inspecting
+  proxies. ([#143](https://github.com/raine/claude-code-proxy/pull/143))
+- Codex compaction requests that omit a reasoning effort now use the configured
+  compaction effort cap, reducing unnecessary latency and token usage.
+  ([#151](https://github.com/raine/claude-code-proxy/pull/151))
+- Image-heavy Claude Code sessions can send Anthropic-compatible requests up to
+  64 MiB instead of becoming unusable after crossing the previous 16 MiB limit.
+  ([#152](https://github.com/raine/claude-code-proxy/pull/152))
+- Structured traffic captures redact replayable Codex compaction and reasoning
+  data, reducing sensitive capture contents and file size.
+  ([#153](https://github.com/raine/claude-code-proxy/pull/153))
+- Grok streams show estimated input usage from the start and use the provider's
+  exact total when available, so Claude Code's status bar no longer stays at
+  zero input tokens. Grok 4.5 and 4.6 users can also configure Claude Code for
+  their 500K context window.
+  ([#154](https://github.com/raine/claude-code-proxy/pull/154))
+
+## v0.1.39 (2026-09-10)
+
+- OpenCode Go users can select 14 additional models, including Grok 4.6, GLM 5.3,
+  GLM 5.3 Flash, LongCat 2.0, and Qwen 3.8 Flash. Use `opencode-go/grok-4.6`
+  to select Grok through OpenCode Go.
+  ([#145](https://github.com/raine/claude-code-proxy/pull/145))
+- Fix OpenCode Go responses failing when the provider sends a harmless keepalive
+  after completion. ([#145](https://github.com/raine/claude-code-proxy/pull/145))
+- OpenCode Go now reports malformed response endings and late connection failures
+  instead of marking affected streamed responses as successful.
+
+## v0.1.38 (2026-09-09)
+
+- Fix requests failing with an invalid Artifact tool schema in Claude Code 2.1.265+
+  when using Codex. ([#141](https://github.com/raine/claude-code-proxy/issues/141),
+  [#142](https://github.com/raine/claude-code-proxy/issues/142))
+
+## v0.1.37 (2026-09-08)
+
+- OpenCode Go requests work again instead of failing with a missing session header
+  error. ([#137](https://github.com/raine/claude-code-proxy/issues/137),
+  [#138](https://github.com/raine/claude-code-proxy/pull/138))
+
+## v0.1.36 (2026-09-06)
+
+- Codex users can select GPT-6 Astra with `gpt-6-astra` or its priority-tier
+  `gpt-6-astra-fast` alias.
+  ([#129](https://github.com/raine/claude-code-proxy/pull/129))
+- Codex conversation continuation stays active after tool calls, avoiding
+  unnecessary full-history uploads and reconnects when continuation is enabled.
+  ([#118](https://github.com/raine/claude-code-proxy/issues/118),
+  [#119](https://github.com/raine/claude-code-proxy/pull/119))
+- Claude Code responses include request IDs, including on errors, so transcript
+  tools can avoid double-counting usage and failed requests are easier to trace.
+  ([#104](https://github.com/raine/claude-code-proxy/issues/104),
+  [#105](https://github.com/raine/claude-code-proxy/pull/105))
+- Nix builds avoid dependency download failures caused by crates.io API rate limits.
 
 ## v0.1.35 (2026-08-19)
 

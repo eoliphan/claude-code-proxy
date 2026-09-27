@@ -1,7 +1,7 @@
 use crate::{
-    anthropic::json_error,
+    anthropic::{MAX_ANTHROPIC_REQUEST_BYTES, json_error},
     logging::{Logger, REDACT_KEYS, create_logger},
-    monitor::{EndpointKind, MonitorHandle, MonitorSnapshotDto},
+    monitor::{EndpointKind, MonitorHandle},
     openai_compat::{
         MAX_OPENAI_REQUEST_BYTES, OpenAiError, OpenAiSurface,
         request::{extract_model, parse_request},
@@ -34,7 +34,7 @@ use axum::{
     body::Body,
     extract::{DefaultBodyLimit, FromRequest, Multipart, Query, State},
     http::{Request, StatusCode},
-    response::Response,
+    response::{IntoResponse, Response},
     routing::{get, post},
 };
 use http_body_util::{BodyExt, StreamBody};
@@ -51,7 +51,7 @@ use uuid::Uuid;
 
 const CLAUDE_AUTO_REVIEW_SYSTEM_PREFIX: &str =
     "You are a security monitor for autonomous AI coding agents.";
-const CODEX_AUTO_REVIEW_MODEL: &str = "gpt-5.6-luna";
+const CODEX_AUTO_REVIEW_MODEL: &str = "gpt-6-luna";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct AutoReviewRoute {
@@ -168,9 +168,12 @@ pub async fn serve_listener(
         ])),
     );
     let app = app_with_monitor(Arc::new(Registry::with_default_alias()), monitor);
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown)
-        .await?;
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .with_graceful_shutdown(shutdown)
+    .await?;
     Ok(())
 }
 
@@ -259,7 +262,7 @@ pub fn app_with_features(
     });
     let router = Router::new()
         .route("/healthz", get(healthz))
-        .route("/_monitor/snapshot", get(handler_monitor_snapshot))
+        .route("/monitor", get(handler_monitor))
         .route("/v1/messages", post(handler_messages))
         .route("/v1/messages/count_tokens", post(handler_count_tokens))
         .route("/v1/models", get(handler_models));
@@ -302,22 +305,42 @@ struct AppState {
     transcriptions: Option<Arc<CodexTranscriptionBackend>>,
 }
 
-async fn healthz() -> Json<serde_json::Value> {
-    Json(json!({ "ok": true }))
+async fn handler_monitor(
+    State(state): State<Arc<AppState>>,
+    peer: Option<axum::Extension<axum::extract::ConnectInfo<std::net::SocketAddr>>>,
+) -> Response {
+    let Some(axum::Extension(axum::extract::ConnectInfo(peer))) = peer else {
+        return json_error(
+            StatusCode::FORBIDDEN,
+            "permission_error",
+            "Monitor access requires a local connection",
+        );
+    };
+    if !peer.ip().to_canonical().is_loopback() {
+        return json_error(
+            StatusCode::FORBIDDEN,
+            "permission_error",
+            "Monitor access requires a local connection",
+        );
+    }
+    match &state.monitor {
+        Some(monitor) => (
+            [(http::header::CACHE_CONTROL, "no-store")],
+            Json(crate::monitor::snapshot::MonitorResponse::from(
+                monitor.snapshot(),
+            )),
+        )
+            .into_response(),
+        None => json_error(
+            StatusCode::NOT_FOUND,
+            "not_found_error",
+            "Monitor collection is disabled",
+        ),
+    }
 }
 
-/// Backs `claude-code-proxy attach`: a running proxy always tracks monitor
-/// state (see `ServeMode::Plain` in `main.rs`), even with no TUI rendered
-/// at startup, so this has something to return. Same trust boundary as
-/// every other route here — no new exposure beyond what an unauthenticated
-/// loopback listener already grants.
-async fn handler_monitor_snapshot(
-    State(state): State<Arc<AppState>>,
-) -> Result<Json<MonitorSnapshotDto>, StatusCode> {
-    match &state.monitor {
-        Some(monitor) => Ok(Json(MonitorSnapshotDto::from(&monitor.snapshot()))),
-        None => Err(StatusCode::NOT_FOUND),
-    }
+async fn healthz() -> Json<serde_json::Value> {
+    Json(json!({ "ok": true }))
 }
 
 #[derive(serde::Deserialize)]
@@ -1427,13 +1450,14 @@ async fn dispatch_request(
     }
     let request_guard = RequestMonitorGuard::new(state.monitor.clone(), req_id.clone());
     let now = current_millis();
-    let body_bytes = match axum::body::to_bytes(req.into_body(), MAX_OPENAI_REQUEST_BYTES).await {
+    let body_bytes = match axum::body::to_bytes(req.into_body(), MAX_ANTHROPIC_REQUEST_BYTES).await
+    {
         Ok(bytes) => bytes,
-        Err(err) => {
+        Err(_) => {
             let response = json_error(
-                StatusCode::BAD_REQUEST,
-                "invalid_request_error",
-                format!("Invalid JSON: {err}"),
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "request_too_large",
+                "Request body exceeded the size limit",
             );
             log_request_completed(
                 &log,
@@ -2311,8 +2335,8 @@ mod auto_review_tests {
         let route = apply_auto_review_model(&mut classifier, false, None, "codex")
             .expect("classifier should be routed");
         assert_eq!(route.requested_model, "gpt-5.6-sol");
-        assert_eq!(route.override_model, "gpt-5.6-luna");
-        assert_eq!(classifier.model.as_deref(), Some("gpt-5.6-luna"));
+        assert_eq!(route.override_model, "gpt-6-luna");
+        assert_eq!(classifier.model.as_deref(), Some("gpt-6-luna"));
     }
 
     #[test]

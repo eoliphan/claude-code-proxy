@@ -4,6 +4,7 @@ use axum::http::{Method, Request, StatusCode};
 use axum::response::IntoResponse;
 use claude_code_proxy::{
     MessagesRequest,
+    anthropic::MAX_ANTHROPIC_REQUEST_BYTES,
     config::AliasProvider,
     monitor::{MonitorHandle, RequestStatus},
     provider::{CliHandlers, Generation, GenerationBody, Provider, ProviderError, RequestContext},
@@ -202,7 +203,7 @@ impl Provider for IdentityCaptureProvider {
     }
 
     fn supported_models(&self) -> Vec<String> {
-        vec!["gpt-5.5".to_string(), "gpt-5.6-luna".to_string()]
+        vec!["gpt-5.5".to_string(), "gpt-6-luna".to_string()]
     }
 
     fn cli(&self) -> &'static dyn CliHandlers {
@@ -608,6 +609,107 @@ async fn missing_model_returns_400() {
         .unwrap();
     let error_type = body["error"]["type"].as_str().unwrap_or("");
     assert_eq!(error_type, "invalid_request_error");
+}
+
+async fn error_body(response: axum::response::Response) -> Value {
+    axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .unwrap()
+}
+
+// Builds a valid JSON /v1/messages body of exactly `total_len` bytes that has
+// no "model", so the handler parses it and then fails on the missing model.
+// That failure proves the body cleared the size gate without touching a
+// provider.
+fn padded_messages_body_without_model(total_len: usize) -> String {
+    let prefix = r#"{"messages":[{"role":"user","content":"hello"}],"padding":""#;
+    let suffix = r#""}"#;
+    let padding = total_len - prefix.len() - suffix.len();
+    let mut body = String::with_capacity(total_len);
+    body.push_str(prefix);
+    body.extend(std::iter::repeat_n('a', padding));
+    body.push_str(suffix);
+    assert_eq!(body.len(), total_len);
+    body
+}
+
+#[tokio::test]
+async fn messages_body_over_16mib_clears_size_gate() {
+    const OLD_LIMIT: usize = 16 * 1024 * 1024;
+    const { assert!(MAX_ANTHROPIC_REQUEST_BYTES > OLD_LIMIT) };
+    let app = app(Arc::new(Registry::with_default_alias()));
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/v1/messages")
+                .header("content-type", "application/json")
+                .body(Body::from(padded_messages_body_without_model(
+                    OLD_LIMIT + 1,
+                )))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = error_body(response).await;
+    let message = body["error"]["message"].as_str().unwrap_or("");
+    assert!(
+        message.starts_with("Missing \"model\""),
+        "body over 16 MiB should reach model validation, got: {message}"
+    );
+}
+
+#[tokio::test]
+async fn messages_body_at_limit_clears_size_gate() {
+    let app = app(Arc::new(Registry::with_default_alias()));
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/v1/messages")
+                .header("content-type", "application/json")
+                .body(Body::from(padded_messages_body_without_model(
+                    MAX_ANTHROPIC_REQUEST_BYTES,
+                )))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = error_body(response).await;
+    let message = body["error"]["message"].as_str().unwrap_or("");
+    assert!(
+        message.starts_with("Missing \"model\""),
+        "body at the limit should reach model validation, got: {message}"
+    );
+}
+
+#[tokio::test]
+async fn anthropic_bodies_over_limit_return_request_too_large() {
+    for path in ["/v1/messages", "/v1/messages/count_tokens"] {
+        let response = app(Arc::new(Registry::with_default_alias()))
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(path)
+                    .header("content-type", "application/json")
+                    .body(Body::from(padded_messages_body_without_model(
+                        MAX_ANTHROPIC_REQUEST_BYTES + 1,
+                    )))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        let body = error_body(response).await;
+        assert_eq!(body["error"]["type"], "request_too_large");
+    }
 }
 
 #[tokio::test]
@@ -1373,59 +1475,6 @@ async fn monitor_records_successful_request_events() {
     assert_eq!(state.recent[0].model.as_deref(), Some("gpt-5.4"));
     assert_eq!(state.recent[0].effort.as_deref(), Some("high"));
     assert!(state.recent[0].input_tokens.is_some());
-}
-
-#[tokio::test]
-async fn monitor_snapshot_route_returns_404_when_no_monitor_is_configured() {
-    let app = app(Arc::new(Registry::with_default_alias()));
-    let response = app
-        .oneshot(
-            Request::builder()
-                .method(Method::GET)
-                .uri("/_monitor/snapshot")
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-
-    assert_eq!(response.status(), StatusCode::NOT_FOUND);
-}
-
-#[tokio::test]
-async fn monitor_snapshot_route_returns_the_handles_live_state_as_json() {
-    let monitor = MonitorHandle::new(10);
-    monitor.request_started(
-        "snap-1",
-        Some("snap-session".to_string()),
-        Some(1),
-        claude_code_proxy::monitor::EndpointKind::Messages,
-    );
-    let app = app_with_monitor(
-        Arc::new(Registry::with_default_alias()),
-        Some(monitor.clone()),
-    );
-
-    let response = app
-        .oneshot(
-            Request::builder()
-                .method(Method::GET)
-                .uri("/_monitor/snapshot")
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-
-    assert_eq!(response.status(), StatusCode::OK);
-    let body: Value = axum::body::to_bytes(response.into_body(), usize::MAX)
-        .await
-        .ok()
-        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
-        .unwrap();
-    assert_eq!(body["active"][0]["request_id"], "snap-1");
-    assert_eq!(body["active"][0]["session_id"], "snap-session");
-    assert!(body["active"][0]["elapsed_ms"].is_u64());
 }
 
 #[tokio::test]
