@@ -20,9 +20,11 @@ static ALIAS_MAP: Lazy<HashMap<&'static str, &'static str>> = Lazy::new(|| {
     for alias in ["sonnet", "claude-sonnet-4-6", "claude-sonnet-5"] {
         m.insert(alias, "claude-sonnet-4-6");
     }
-    for alias in ["opus", "claude-opus-4-7", "claude-opus-4-8"] {
+    for alias in ["claude-opus-4-7", "claude-opus-4-8"] {
         m.insert(alias, "claude-opus-4-8");
     }
+    // Bare `opus` follows the newest Opus tier Kiro serves.
+    m.insert("opus", "claude-opus-5-5");
     // Kiro serves these exact versions (confirmed by a live
     // ListAvailableModels call), so they map to themselves rather than to
     // the nearest older tier.
@@ -77,6 +79,7 @@ mod tests {
 
     #[test]
     fn version_aliases_resolve_to_their_intended_kiro_models() {
+        assert_eq!(resolve_model("opus"), "claude-opus-5-5");
         assert_eq!(resolve_model("claude-opus-5-5"), "claude-opus-5-5");
         assert_eq!(resolve_model("claude-opus-5"), "claude-opus-5");
         assert_eq!(resolve_model("claude-sonnet-5"), "claude-sonnet-4-6");
