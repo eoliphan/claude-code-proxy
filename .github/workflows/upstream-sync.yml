@@ -1,0 +1,206 @@
+name: Upstream Sync
+
+# Merges raine/claude-code-proxy into this fork on a branch and opens a PR.
+# Claude resolves conflicts and checks that fork decisions survive the merge
+# (see docs/agents/fork-maintenance.md). A human reviews and merges the PR.
+
+on:
+  schedule:
+    - cron: '17 6 * * *'
+  workflow_dispatch:
+
+concurrency:
+  group: upstream-sync
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+  actions: read
+  id-token: write
+
+env:
+  UPSTREAM_REPO: raine/claude-code-proxy
+  # A PAT (or App token) lets CI run on the PR. GITHUB_TOKEN works as a fallback,
+  # but PRs it opens do not trigger other workflows.
+  GH_TOKEN: ${{ secrets.AGENT_PAT || secrets.GITHUB_TOKEN }}
+
+jobs:
+  sync:
+    if: github.repository == 'eoliphan/claude-code-proxy'
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: main
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Detect new upstream commits
+        id: detect
+        run: |
+          git remote add upstream "https://github.com/${UPSTREAM_REPO}.git"
+          git fetch --no-tags upstream main
+
+          if git merge-base --is-ancestor upstream/main HEAD; then
+            echo "Fork already contains upstream/main."
+            echo "behind=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          sha=$(git rev-parse --short=8 upstream/main)
+          branch="sync/upstream-${sha}"
+
+          if git ls-remote --exit-code --heads "https://github.com/${GITHUB_REPOSITORY}.git" "$branch" >/dev/null 2>&1; then
+            echo "Branch ${branch} already exists. Skipping."
+            echo "behind=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          open=$(gh pr list -R "$GITHUB_REPOSITORY" --label upstream-sync --state open --json number -q 'length')
+          if [ "$open" != "0" ]; then
+            echo "A sync PR is already open. Skipping."
+            echo "behind=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          {
+            echo "behind=true"
+            echo "branch=${branch}"
+            echo "sha=${sha}"
+          } >> "$GITHUB_OUTPUT"
+
+      - uses: dtolnay/rust-toolchain@stable
+        if: steps.detect.outputs.behind == 'true'
+        with:
+          components: clippy, rustfmt
+
+      - uses: Swatinem/rust-cache@v2
+        if: steps.detect.outputs.behind == 'true'
+
+      - name: Install tools
+        if: steps.detect.outputs.behind == 'true'
+        run: cargo install checkle just --locked
+
+      - name: Merge upstream/main (no commit)
+        id: merge
+        if: steps.detect.outputs.behind == 'true'
+        env:
+          BRANCH: ${{ steps.detect.outputs.branch }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout -b "$BRANCH"
+          if git merge --no-ff --no-commit upstream/main; then
+            echo "conflicts=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "conflicts=true" >> "$GITHUB_OUTPUT"
+          fi
+          git diff --name-only --diff-filter=U > "$RUNNER_TEMP/conflicts.txt" || true
+          echo "Conflicting files:"
+          cat "$RUNNER_TEMP/conflicts.txt"
+
+      - name: Resolve conflicts and check fork decisions
+        if: steps.detect.outputs.behind == 'true'
+        uses: anthropics/claude-code-action@v1
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          github_token: ${{ secrets.AGENT_PAT || secrets.GITHUB_TOKEN }}
+          prompt: |
+            This working tree holds an uncommitted merge of upstream/main
+            (${{ env.UPSTREAM_REPO }}) into this fork. Conflicts: ${{ steps.merge.outputs.conflicts }}.
+
+            1. Read docs/agents/fork-maintenance.md. Follow it.
+            2. If conflicts exist (`git diff --name-only --diff-filter=U`), resolve every file.
+               Keep upstream additions. Keep every fork decision in the decision table.
+            3. Check for silent drift: run `git diff HEAD -- src` and look for upstream
+               changes that bypass a fork decision without a conflict marker. Fix any
+               regression in the working tree.
+            4. Add one line to the CHANGELOG.md Unreleased section only when the fork
+               needs a note, for example when you overrode an upstream behavior.
+            5. Run `just check`. Fix failures that the merge caused. Do not delete or
+               weaken tests.
+            6. Stage resolved files with `git add`. Do NOT run `git commit`,
+               `git merge --continue`, or `git push`. The workflow commits and pushes.
+            7. End with a short summary: each conflicting file and how you resolved it,
+               plus any fork decision you had to restore.
+          claude_args: >-
+            --max-turns 60
+            --allowedTools "Read,Edit,Write,Glob,Grep,Bash(git status:*),Bash(git diff:*),Bash(git log:*),Bash(git show:*),Bash(git add:*),Bash(git checkout:*),Bash(just:*),Bash(cargo:*),Bash(rg:*)"
+
+      - name: Finalize merge commit
+        id: finalize
+        if: steps.detect.outputs.behind == 'true'
+        run: |
+          unmerged=$(git diff --name-only --diff-filter=U)
+          markers=$(git grep -nE '^(<<<<<<<|>>>>>>>) ' -- . || true)
+          if [ -n "$unmerged" ] || [ -n "$markers" ]; then
+            echo "Unresolved conflicts remain."
+            echo "$unmerged"
+            echo "$markers"
+            git merge --abort || true
+            echo "failed=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          git add -A
+          git commit --no-edit
+          echo "failed=false" >> "$GITHUB_OUTPUT"
+
+      - name: Run checks
+        id: checks
+        if: steps.finalize.outputs.failed == 'false'
+        continue-on-error: true
+        run: just check-ci
+
+      - name: Open PR
+        if: steps.finalize.outputs.failed == 'false'
+        env:
+          BRANCH: ${{ steps.detect.outputs.branch }}
+          SHA: ${{ steps.detect.outputs.sha }}
+          CHECKS: ${{ steps.checks.outcome }}
+          CONFLICTS: ${{ steps.merge.outputs.conflicts }}
+        run: |
+          git push "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" "$BRANCH"
+          gh label create upstream-sync -R "$GITHUB_REPOSITORY" -c 5319e7 \
+            -d "Automated merge of upstream changes" --force
+
+          {
+            echo "Merges \`${UPSTREAM_REPO}\` at \`${SHA}\` into \`main\`."
+            echo
+            echo "Merge conflicts: ${CONFLICTS}. Local checks (\`just check-ci\`): ${CHECKS}."
+            echo
+            echo "### Upstream commits"
+            git log --no-merges --format='- `%h` %s' "main..upstream/main"
+            echo
+            echo "Review against the fork decision table in \`docs/agents/fork-maintenance.md\`."
+            echo "Workflow run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          } > "$RUNNER_TEMP/pr-body.md"
+
+          draft=""
+          if [ "$CHECKS" != "success" ]; then draft="--draft"; fi
+
+          gh pr create -R "$GITHUB_REPOSITORY" --base main --head "$BRANCH" \
+            --title "chore: sync upstream ${SHA}" \
+            --body-file "$RUNNER_TEMP/pr-body.md" \
+            --label upstream-sync $draft
+
+      - name: Open issue when conflicts are unresolved
+        if: steps.finalize.outputs.failed == 'true'
+        env:
+          SHA: ${{ steps.detect.outputs.sha }}
+        run: |
+          {
+            echo "The upstream sync for \`${SHA}\` stopped with unresolved merge conflicts."
+            echo
+            echo "Conflicting files:"
+            sed 's/^/- /' "$RUNNER_TEMP/conflicts.txt"
+            echo
+            echo "Follow \`docs/agents/fork-maintenance.md\` and merge \`upstream/main\` by hand."
+            echo "Workflow run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          } > "$RUNNER_TEMP/issue-body.md"
+          gh issue create -R "$GITHUB_REPOSITORY" \
+            --title "Upstream sync ${SHA} needs manual conflict resolution" \
+            --body-file "$RUNNER_TEMP/issue-body.md" \
+            --label ready-for-human
