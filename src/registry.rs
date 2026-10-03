@@ -54,6 +54,7 @@ pub(crate) const CODEX_MODELS: &[&str] = &[
     "gpt-6-astra",
     "gpt-6-luna",
     "gpt-6-sol",
+    "gpt-6.1-sol",
 ];
 
 pub(crate) const KIMI_MODELS: &[&str] = &["kimi-for-coding", "kimi-k2.6", "kimi-k3", "k2.6", "k3"];
@@ -544,9 +545,15 @@ mod tests {
     }
 
     #[test]
-    fn gpt_6_sol_and_luna_route_to_codex() {
+    fn gpt_6_models_route_to_codex() {
         let registry = Registry::new(AliasProvider::Codex);
-        for model in ["gpt-6-sol", "gpt-6-sol-fast", "gpt-6-luna"] {
+        for model in [
+            "gpt-6-sol",
+            "gpt-6-sol-fast",
+            "gpt-6-luna",
+            "gpt-6.1-sol",
+            "gpt-6.1-sol-fast",
+        ] {
             assert_eq!(
                 registry.provider_for_model(model, None).unwrap().name(),
                 "codex"

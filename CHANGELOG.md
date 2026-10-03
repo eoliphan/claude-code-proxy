@@ -19,6 +19,12 @@ description: Release notes for claude-code-proxy.
   the `claude-opus-5-5` and `claude-opus-5` aliases resolve to those models.
   Kiro model discovery now works for IAM Identity Center subscriptions.
 
+## v0.1.43 (2026-09-30)
+
+- Codex users can select GPT-6.1 Sol with `gpt-6.1-sol` or its
+  `gpt-6.1-sol-fast` priority-tier variant.
+  ([#169](https://github.com/raine/claude-code-proxy/issues/169))
+
 ## v0.1.42 (2026-09-23)
 
 - Codex users can select GPT-6 Sol and GPT-6 Luna, including their `-fast`
