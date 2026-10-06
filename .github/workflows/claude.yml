@@ -70,6 +70,9 @@ jobs:
           # A mention keeps the empty prompt and follows the comment text.
           prompt: "${{ github.event_name == 'issues' && github.event.action == 'labeled' && format('Implement issue #{0} ({1}). Read docs/agents/fork-maintenance.md and the issue with `gh issue view {0} --comments`. Create a branch named agent/issue-{0}-<short-slug> from main. Make the change, add tests, run `just check-ci`, and fix failures. Commit with a Conventional Commits message. Push the branch and open a PR to main with `gh pr create`. The PR body must contain `Closes #{0}`. Never push to main. If the issue is ambiguous, or a fork decision conflicts with it, comment on the issue and stop.', github.event.issue.number, github.event.issue.title) || '' }}"
 
+          # Temporary: show the agent's full output while debugging issue-triggered runs.
+          show_full_output: true
+
           claude_args: >-
             --max-turns 80
             --allowedTools "Read,Edit,Write,Glob,Grep,Bash(git:*),Bash(gh pr create:*),Bash(gh pr view:*),Bash(gh pr diff:*),Bash(gh issue view:*),Bash(gh issue comment:*),Bash(just:*),Bash(cargo:*),Bash(rg:*),Bash(fd:*)"
