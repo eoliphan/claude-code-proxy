@@ -5,6 +5,8 @@ description: Release notes for claude-code-proxy.
 
 ## Unreleased
 
+- Codex users can select GPT-6.1 Sol, including its `-fast` alias. Opus aliases
+  now route to GPT-6.1 Sol instead of GPT-6 Sol.
 - Codex routes Fable aliases to GPT-6 Astra through the full Responses API,
   instead of upstream's GPT-6 Sol routing.
 - Kiro (AWS CodeWhisperer/Q) joins Codex, Kimi, Grok, OpenCode Go, and

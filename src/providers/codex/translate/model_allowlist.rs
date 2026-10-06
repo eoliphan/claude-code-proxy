@@ -17,6 +17,7 @@ pub const ALLOWED_MODELS: &[&str] = &[
     "gpt-6-astra",
     "gpt-6-luna",
     "gpt-6-sol",
+    "gpt-6.1-sol",
 ];
 
 pub const MODEL_ALIASES: &[(&str, &str)] = &[
@@ -26,11 +27,11 @@ pub const MODEL_ALIASES: &[(&str, &str)] = &[
     ("sonnet", "gpt-5.6-terra"),
     ("claude-sonnet-4-6", "gpt-5.6-terra"),
     ("claude-sonnet-5", "gpt-5.6-terra"),
-    ("opus", "gpt-6-sol"),
-    ("claude-opus-4-7", "gpt-6-sol"),
-    ("claude-opus-4-8", "gpt-6-sol"),
-    ("claude-opus-5", "gpt-6-sol"),
-    ("claude-opus-5-5", "gpt-6-sol"),
+    ("opus", "gpt-6.1-sol"),
+    ("claude-opus-4-7", "gpt-6.1-sol"),
+    ("claude-opus-4-8", "gpt-6.1-sol"),
+    ("claude-opus-5", "gpt-6.1-sol"),
+    ("claude-opus-5-5", "gpt-6.1-sol"),
 ];
 
 pub fn resolve_model_alias(model: &str) -> Option<&'static str> {
@@ -129,7 +130,12 @@ pub fn uses_responses_lite(model: &str) -> bool {
     // gpt-6-astra deliberately uses the full Responses API (fork decision).
     matches!(
         model,
-        "gpt-5.6-luna" | "gpt-5.6-sol" | "gpt-5.6-terra" | "gpt-6-luna" | "gpt-6-sol"
+        "gpt-5.6-luna"
+            | "gpt-5.6-sol"
+            | "gpt-5.6-terra"
+            | "gpt-6-luna"
+            | "gpt-6-sol"
+            | "gpt-6.1-sol"
     )
 }
 
@@ -196,14 +202,14 @@ mod tests {
     #[test]
     fn opus_resolves_to_sol() {
         let r = resolve_model_request("opus");
-        assert_eq!(r.model, "gpt-6-sol");
+        assert_eq!(r.model, "gpt-6.1-sol");
     }
 
     #[test]
     fn opus_aliases_resolve_to_sol() {
         for model in ["claude-opus-4-8", "claude-opus-5", "claude-opus-5-5"] {
             let r = resolve_model_request(model);
-            assert_eq!(r.model, "gpt-6-sol");
+            assert_eq!(r.model, "gpt-6.1-sol");
         }
     }
 
@@ -253,9 +259,18 @@ mod tests {
     }
 
     #[test]
+    fn gpt_6_1_sol_fast_resolves_to_priority() {
+        let r = resolve_model_request("gpt-6.1-sol-fast");
+        assert_eq!(r.model, "gpt-6.1-sol");
+        assert_eq!(r.service_tier, Some(ServiceTier::Priority));
+        assert!(assert_allowed_model("gpt-6.1-sol").is_ok());
+    }
+
+    #[test]
     fn gpt_6_models_use_responses_lite() {
         assert!(uses_responses_lite("gpt-6-sol"));
         assert!(uses_responses_lite("gpt-6-luna"));
+        assert!(uses_responses_lite("gpt-6.1-sol"));
     }
 
     #[test]

@@ -28,7 +28,7 @@ The proxy owns its tokens and does not read native Codex CLI credentials. It ref
 
 Use `claude-code-proxy models` as the current catalog. Model access depends on your ChatGPT account. A model rejected by the subscription produces the upstream error verbatim.
 
-Claude-style aliases map to Codex models: `haiku` and `claude-haiku-*` to `gpt-6-luna`, `sonnet` and `claude-sonnet-*` to `gpt-5.6-terra`, and `opus` and `claude-opus-*` (including `claude-opus-5-5`) to `gpt-6-sol`.
+Claude-style aliases map to Codex models: `haiku` and `claude-haiku-*` to `gpt-6-luna`, `sonnet` and `claude-sonnet-*` to `gpt-5.6-terra`, and `opus` and `claude-opus-*` (including `claude-opus-5-5`) to `gpt-6.1-sol`.
 
 `fable` and supported `claude-fable-*` identifiers resolve to `gpt-6-astra`. Astra uses the full Responses API. Fable aliases that end in `-fast` are unsupported. Use the direct `gpt-6-astra-fast` model ID to request the priority service tier.
 
