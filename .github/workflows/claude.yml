@@ -75,4 +75,20 @@ jobs:
 
           claude_args: >-
             --max-turns 80
-            --allowedTools "Read,Edit,Write,Glob,Grep,Bash(git:*),Bash(gh pr create:*),Bash(gh pr view:*),Bash(gh pr diff:*),Bash(gh issue view:*),Bash(gh issue comment:*),Bash(just:*),Bash(cargo:*),Bash(rg:*),Bash(fd:*)"
+            --allowedTools "Read,Edit,Write,Glob,Grep,Bash(git:*),Bash(gh pr create:*),Bash(gh pr view:*),Bash(gh pr diff:*),Bash(gh issue view:*),Bash(gh issue comment:*),Bash(just:*),Bash(cargo:*),Bash(rg:*),Bash(fd:*),Bash(python3:*),Bash(sed:*),Bash(mkdir:*)"
+
+      # The action reports success even when the agent session ends early. Fail
+      # the job and tell the issue when a label-triggered run left no branch.
+      - name: Verify the agent produced a branch
+        if: always() && github.event_name == 'issues' && github.event.action == 'labeled' && steps.claude.conclusion != 'skipped'
+        env:
+          ISSUE: ${{ github.event.issue.number }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          refs=$(gh api "repos/${GITHUB_REPOSITORY}/git/matching-refs/heads/agent/issue-${ISSUE}-" -q 'length')
+          if [ "$refs" = "0" ]; then
+            gh issue comment "$ISSUE" -R "$GITHUB_REPOSITORY" \
+              --body "The agent run ended without pushing a branch. Run: ${RUN_URL}"
+            echo "No agent/issue-${ISSUE}-* branch found."
+            exit 1
+          fi

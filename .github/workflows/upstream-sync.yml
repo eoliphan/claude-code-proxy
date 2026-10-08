@@ -126,9 +126,12 @@ jobs:
                `git merge --continue`, or `git push`. The workflow commits and pushes.
             7. End with a short summary: each conflicting file and how you resolved it,
                plus any fork decision you had to restore.
+          # Temporary: show the agent's full output while debugging silent runs.
+          show_full_output: true
+
           claude_args: >-
             --max-turns 60
-            --allowedTools "Read,Edit,Write,Glob,Grep,Bash(git status:*),Bash(git diff:*),Bash(git log:*),Bash(git show:*),Bash(git add:*),Bash(git checkout:*),Bash(just:*),Bash(cargo:*),Bash(rg:*)"
+            --allowedTools "Read,Edit,Write,Glob,Grep,Bash(git status:*),Bash(git diff:*),Bash(git log:*),Bash(git show:*),Bash(git add:*),Bash(git checkout:*),Bash(just:*),Bash(cargo:*),Bash(rg:*),Bash(python3:*),Bash(sed:*)"
 
       - name: Finalize merge commit
         id: finalize
