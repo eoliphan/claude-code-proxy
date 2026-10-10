@@ -40,6 +40,8 @@ curl http://127.0.0.1:18765/v1/models
 
 Every registered Codex model also has a local `-fast` form. The proxy removes `-fast` from the upstream model and requests the priority service tier. A configured `codex.serviceTier` or `CCP_CODEX_SERVICE_TIER` override wins.
 
+Claude Code fast mode (`/fast`) also selects the priority tier. When it is on, Claude Code sends `speed: "fast"` in the request body. It does this only for Opus model names, so the setting takes effect when an Opus alias routes to a Codex model. A model name such as `gpt-6.1-sol` carries no signal, so use its `-fast` form. The proxy does not forward `speed` upstream.
+
 ## The `[1m]` hint
 
 A trailing `[1m]` affects Claude Code's local compaction policy. The proxy strips it before matching and forwarding the model. Use it only when the upstream model and account can accept the resulting context, and set a safe `CLAUDE_CODE_AUTO_COMPACT_WINDOW` when the real limit is below one million tokens.

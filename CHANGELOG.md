@@ -5,6 +5,10 @@ description: Release notes for claude-code-proxy.
 
 ## Unreleased
 
+- Codex honors Claude Code fast mode. When `/fast` is on, Claude Code sends
+  `speed: "fast"` for Opus model names, and the proxy requests the priority
+  service tier, like a `-fast` model name. A configured `codex.serviceTier` or
+  `CCP_CODEX_SERVICE_TIER` still wins. Grok accepts and ignores the field.
 - Codex routes Fable aliases to GPT-6 Astra through the full Responses API,
   instead of upstream's GPT-6 Sol routing.
 - Kiro (AWS CodeWhisperer/Q) joins Codex, Kimi, Grok, OpenCode Go, and
