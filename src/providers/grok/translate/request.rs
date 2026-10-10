@@ -430,6 +430,7 @@ fn reject_unknown_top_level(req: &MessagesRequest) -> anyhow::Result<()> {
             "top_k",
             "stop_sequences",
             "service_tier",
+            "speed",
         ]
         .contains(&key.as_str())
         {
@@ -1895,6 +1896,25 @@ mod tests {
             .to_string();
             assert_eq!(error, format!("unsupported tool type: {kind}"));
         }
+    }
+
+    #[test]
+    fn grok_translation_accepts_and_ignores_claude_code_fast_speed() {
+        let request: MessagesRequest = serde_json::from_value(serde_json::json!({
+            "model":"grok-4.5",
+            "messages":[{"role":"user","content":"hi"}],
+            "speed":"fast"
+        }))
+        .unwrap();
+        let translated = translate_request_with_options(
+            &request,
+            "grok-4.5".into(),
+            crate::config::GrokToolImageMode::Omit,
+            false,
+        )
+        .expect("speed must not be rejected as an unknown field");
+        let body = serde_json::to_value(&translated).unwrap();
+        assert!(body.get("speed").is_none());
     }
 
     #[test]

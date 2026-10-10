@@ -51,6 +51,17 @@ pub struct ResolvedModel {
     pub service_tier: Option<ServiceTier>,
 }
 
+impl ResolvedModel {
+    /// Claude Code fast mode (`speed: "fast"`) asks for the priority tier, like a
+    /// `-fast` model suffix. A tier that is already set stays as it is. The
+    /// `codex.serviceTier` override still wins later, when the request is built.
+    pub fn apply_fast_speed(&mut self, wants_fast: bool) {
+        if wants_fast && self.service_tier.is_none() {
+            self.service_tier = Some(ServiceTier::Priority);
+        }
+    }
+}
+
 fn fast_model_aliases() -> HashSet<String> {
     ALLOWED_MODELS.iter().map(|m| format!("{m}-fast")).collect()
 }
@@ -272,6 +283,34 @@ mod tests {
         let r = resolve_model_request("gpt-5.6-sol-fast");
         assert_eq!(r.model, "gpt-5.6-sol");
         assert_eq!(r.service_tier, Some(ServiceTier::Priority));
+    }
+
+    #[test]
+    fn fast_speed_adds_priority_to_an_opus_alias() {
+        let mut r = resolve_model_request("claude-opus-5-5");
+        assert_eq!(r.service_tier, None);
+        r.apply_fast_speed(true);
+        assert_eq!(r.service_tier, Some(ServiceTier::Priority));
+    }
+
+    #[test]
+    fn missing_fast_speed_leaves_the_tier_alone() {
+        let mut r = resolve_model_request("gpt-6-sol");
+        r.apply_fast_speed(false);
+        assert_eq!(r.service_tier, None);
+    }
+
+    #[test]
+    fn fast_speed_keeps_a_tier_that_is_already_set() {
+        let mut r = resolve_model_request("gpt-6-sol-fast");
+        r.apply_fast_speed(true);
+        assert_eq!(r.service_tier, Some(ServiceTier::Priority));
+        let mut flex = ResolvedModel {
+            model: "gpt-6-sol".to_string(),
+            service_tier: Some(ServiceTier::Flex),
+        };
+        flex.apply_fast_speed(true);
+        assert_eq!(flex.service_tier, Some(ServiceTier::Flex));
     }
 
     #[test]

@@ -103,6 +103,7 @@ impl CodexProvider {
 
         let mut resolved =
             resolve_model_request_with_config_override(model, !body.bypass_provider_model_override);
+        resolved.apply_fast_speed(body.wants_fast_speed());
         if let Err(e) = assert_allowed_model(&resolved.model) {
             return json_error(
                 StatusCode::BAD_REQUEST,
@@ -561,6 +562,7 @@ impl Provider for CodexProvider {
         let model = body.model.as_deref().unwrap_or("gpt-6-sol");
         let mut resolved =
             resolve_model_request_with_config_override(model, !body.bypass_provider_model_override);
+        resolved.apply_fast_speed(body.wants_fast_speed());
         if let Err(e) = assert_allowed_model(&resolved.model) {
             return json_error(
                 StatusCode::BAD_REQUEST,
