@@ -19,6 +19,13 @@ description: Release notes for claude-code-proxy.
   the `claude-opus-5-5` and `claude-opus-5` aliases resolve to those models.
   Kiro model discovery now works for IAM Identity Center subscriptions.
 
+## v0.1.45 (2026-10-10)
+
+- Codex users can request the ultrafast service tier with
+  `gpt-6-astra-ultrafast` or `gpt-6.1-sol-ultrafast`, or set
+  `CCP_CODEX_SERVICE_TIER=ultrafast` for Messages requests.
+  ([#170](https://github.com/raine/claude-code-proxy/pull/170))
+
 ## v0.1.44 (2026-10-07)
 
 - Codex requests that repeatedly produce no output now fail after the proxy's
