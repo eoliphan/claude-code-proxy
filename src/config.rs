@@ -403,7 +403,7 @@ pub fn grok_client_version() -> String {
     {
         return version;
     }
-    "0.2.93".to_string()
+    "1.0.13".to_string()
 }
 
 // ---------------------------------------------------------------------------
@@ -1032,6 +1032,7 @@ mod tests {
             EnvGuard::unset("CCP_CODEX_TRANSCRIPTIONS_API"),
             EnvGuard::unset("CCP_CODEX_HEADER_TIMEOUT_MS"),
             EnvGuard::unset("CCP_AUTO_REVIEW_MODEL"),
+            EnvGuard::unset("CCP_GROK_CLIENT_VERSION"),
         ];
         guards.push(EnvGuard::set("CCP_CONFIG_DIR", config.path()));
         guards
@@ -1042,6 +1043,24 @@ mod tests {
             "CCP_CONFIG_DIR".to_string(),
             config.path().to_string_lossy().into_owned(),
         )])
+    }
+
+    #[test]
+    fn grok_client_version_defaults_and_overrides() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let config = tempfile::TempDir::new().unwrap();
+        let _guards = isolated_env(&config);
+        assert_eq!(grok_client_version(), "1.0.13");
+
+        std::fs::write(
+            config.path().join("config.json"),
+            r#"{"grok":{"clientVersion":"1.0.14"}}"#,
+        )
+        .unwrap();
+        assert_eq!(grok_client_version(), "1.0.14");
+
+        let _version = EnvGuard::set("CCP_GROK_CLIENT_VERSION", "1.0.15");
+        assert_eq!(grok_client_version(), "1.0.15");
     }
 
     #[test]
