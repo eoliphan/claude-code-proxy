@@ -5,6 +5,8 @@ description: Release notes for claude-code-proxy.
 
 ## Unreleased
 
+- Codex routes Opus aliases to GPT-6.1 Sol instead of upstream's GPT-6 Sol
+  routing.
 - Codex routes Fable aliases to GPT-6 Astra through the full Responses API,
   instead of upstream's GPT-6 Sol routing.
 - Kiro (AWS CodeWhisperer/Q) joins Codex, Kimi, Grok, OpenCode Go, and
@@ -18,6 +20,52 @@ description: Release notes for claude-code-proxy.
 - Kiro serves Claude Opus 5.5 and Opus 5. With `aliasProvider` set to `kiro`,
   the `claude-opus-5-5` and `claude-opus-5` aliases resolve to those models.
   Kiro model discovery now works for IAM Identity Center subscriptions.
+
+## v0.1.47 (2026-10-25)
+
+- Grok requests no longer fail with HTTP 502 because of the outdated default
+  client version; version rejections now include instructions for updating it.
+  ([#180](https://github.com/raine/claude-code-proxy/issues/180))
+- Grok and Cursor browser login on Windows preserve the full login URL instead
+  of truncating it at `&`.
+  ([#106](https://github.com/raine/claude-code-proxy/issues/106),
+  [#192](https://github.com/raine/claude-code-proxy/pull/192))
+- Codex browser login keeps waiting for authentication after unrelated or
+  malformed requests reach its callback listener.
+  ([#167](https://github.com/raine/claude-code-proxy/pull/167))
+- Unsupported message-thread continuations are rejected before reaching a
+  provider, instead of silently treating partial history as a full conversation.
+  ([#148](https://github.com/raine/claude-code-proxy/issues/148),
+  [#191](https://github.com/raine/claude-code-proxy/pull/191))
+- Codex empty-completion retries and the final 503 now appear in server logs,
+  making these failures easier to diagnose without changing retry behavior.
+  ([#177](https://github.com/raine/claude-code-proxy/issues/177),
+  [#178](https://github.com/raine/claude-code-proxy/pull/178))
+
+## v0.1.46 (2026-10-23)
+
+- Cursor models can read and write files and run shell commands without stopping
+  after one reply, displaying tool calls as text, or repeating completed calls.
+  ([#166](https://github.com/raine/claude-code-proxy/issues/166),
+  [#179](https://github.com/raine/claude-code-proxy/pull/179))
+- Cursor models receive instructions for calling MCP and other client tools,
+  including tools discovered through tool search.
+  ([#179](https://github.com/raine/claude-code-proxy/pull/179))
+- Cursor file reads no longer expose display line numbers that models could
+  accidentally copy into files they write.
+  ([#179](https://github.com/raine/claude-code-proxy/pull/179))
+- Cursor context usage no longer appears inflated after tool calls.
+  ([#179](https://github.com/raine/claude-code-proxy/pull/179))
+- Cursor model effort variants, such as `cursor:claude-sonnet-5-5-medium`,
+  now use the correct settings instead of failing with model-not-found errors.
+  ([#193](https://github.com/raine/claude-code-proxy/pull/193))
+
+## v0.1.45 (2026-10-10)
+
+- Codex users can request the ultrafast service tier with
+  `gpt-6-astra-ultrafast` or `gpt-6.1-sol-ultrafast`, or set
+  `CCP_CODEX_SERVICE_TIER=ultrafast` for Messages requests.
+  ([#170](https://github.com/raine/claude-code-proxy/pull/170))
 
 ## v0.1.44 (2026-10-07)
 

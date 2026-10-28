@@ -40,7 +40,9 @@ Unknown future IDs are accepted through `cursor:<raw-model>`.
 
 ## Effort mapping
 
-Claude Code's `/effort` selects matching Cursor catalog variants when available. For example, `cursor:gpt-5.5` plus high effort can resolve to `gpt-5.5-high`. Explicit effort suffixes are preserved. Fast suffixes remain when the catalog supports them, and models without effort variants stay unchanged.
+Some Cursor list ids are not wire ids. `cursor:claude-sonnet-5-5-medium` is sent as family id `claude-sonnet-5-5` with `context=300k` and `reasoning_effort=medium`. The proxy does this for the families whose catalog stores effort in parameters (`reasoning_effort`, `effort`, or `reasoning`) and includes `context` only when that family's non-max variant has one. `fast` is sent only when the family lists it. Sending `fast` on Claude Sonnet 5.5 makes Cursor return `ERROR_BAD_MODEL_NAME`.
+
+Composer and Grok stay a family id plus the `fast` flag. A trailing `-fast` on Opus is kept. An unknown `cursor:<id>` is forwarded as that id with `fast`. A bare family id uses that family's default effort. This is the non-max parameter set, not the 1m max-mode variant.
 
 ## Tools and multimodal input
 

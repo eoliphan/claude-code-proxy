@@ -342,7 +342,7 @@ static WS_CONNECT_GATE: once_cell::sync::Lazy<WebSocketConnectGate> =
 #[allow(deprecated)]
 fn next_monotonic_nonzero(sequence: &AtomicU64, label: &str) -> u64 {
     let previous = sequence
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+        .try_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
             value.checked_add(1)
         })
         .unwrap_or_else(|_| panic!("{label} sequence exhausted"));
