@@ -23,9 +23,9 @@ pub const MODEL_ALIASES: &[(&str, &str)] = &[
     ("haiku", "gpt-6-luna"),
     ("claude-haiku-4-5", "gpt-6-luna"),
     ("claude-haiku-4-5-20251001", "gpt-6-luna"),
-    ("sonnet", "gpt-5.6-terra"),
-    ("claude-sonnet-4-6", "gpt-5.6-terra"),
-    ("claude-sonnet-5", "gpt-5.6-terra"),
+    ("sonnet", "gpt-6.1-terra"),
+    ("claude-sonnet-4-6", "gpt-6.1-terra"),
+    ("claude-sonnet-5", "gpt-6.1-terra"),
     ("opus", "gpt-6.1-sol"),
     ("claude-opus-4-7", "gpt-6.1-sol"),
     ("claude-opus-4-8", "gpt-6.1-sol"),
@@ -227,13 +227,13 @@ mod tests {
     #[test]
     fn sonnet_resolves_to_terra() {
         let r = resolve_model_request("sonnet");
-        assert_eq!(r.model, "gpt-5.6-terra");
+        assert_eq!(r.model, "gpt-6.1-terra");
     }
 
     #[test]
     fn sonnet_5_resolves_to_terra() {
         let r = resolve_model_request("claude-sonnet-5");
-        assert_eq!(r.model, "gpt-5.6-terra");
+        assert_eq!(r.model, "gpt-6.1-terra");
     }
 
     #[test]
