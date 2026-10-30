@@ -93,7 +93,7 @@ When Codex is the alias provider, the common aliases resolve as follows:
 | Alias family | Codex model |
 | --- | --- |
 | `haiku` and registered Haiku IDs | `gpt-5.6-luna` |
-| `sonnet` and registered Sonnet IDs | `gpt-5.6-terra` |
+| `sonnet` and registered Sonnet IDs | `gpt-6.1-terra` |
 | `opus` and registered Opus IDs | `gpt-5.6-sol` |
 | `fable` and nonempty `claude-fable-*` IDs | `gpt-6-astra` |
 
