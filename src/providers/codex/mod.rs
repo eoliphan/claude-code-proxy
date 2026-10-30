@@ -2204,6 +2204,9 @@ mod tests {
         assert!(models.contains(&"gpt-6.1-sol".to_string()));
         assert!(models.contains(&"gpt-6.1-sol-fast".to_string()));
         assert!(models.contains(&"gpt-6.1-sol-ultrafast".to_string()));
+        assert!(models.contains(&"gpt-6.1-terra".to_string()));
+        assert!(models.contains(&"gpt-6.1-terra-fast".to_string()));
+        assert!(!models.contains(&"gpt-6.1-terra-ultrafast".to_string()));
         assert!(models.contains(&"gpt-5.4".to_string()));
         assert!(models.contains(&"gpt-5.4-mini".to_string()));
         assert!(models.contains(&"gpt-6-astra-fast".to_string()));

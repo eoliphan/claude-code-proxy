@@ -5,6 +5,8 @@ description: Release notes for claude-code-proxy.
 
 ## Unreleased
 
+- Codex users can select GPT-6.1 Terra, including its `-fast` alias. The Claude
+  model aliases keep their current targets.
 - Codex routes Opus aliases to GPT-6.1 Sol instead of upstream's GPT-6 Sol
   routing.
 - Codex routes Fable aliases to GPT-6 Astra through the full Responses API,
