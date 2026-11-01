@@ -92,9 +92,9 @@ When Codex is the alias provider, the common aliases resolve as follows:
 
 | Alias family | Codex model |
 | --- | --- |
-| `haiku` and registered Haiku IDs | `gpt-5.6-luna` |
+| `haiku` and registered Haiku IDs | `gpt-6-luna` |
 | `sonnet` and registered Sonnet IDs | `gpt-6.1-terra` |
-| `opus` and registered Opus IDs | `gpt-5.6-sol` |
+| `opus` and registered Opus IDs | `gpt-6.1-sol` |
 | `fable` and nonempty `claude-fable-*` IDs | `gpt-6-astra` |
 
 The catalog lists `fable`, `claude-fable-5`, and `claude-fable-5-1`. Future nonempty `claude-fable-*` IDs also route to Astra, although they do not appear in the finite catalog. The proxy rejects `fable-*` shorthand and Fable aliases that end in `-fast`. Use `gpt-6-astra-fast` to request Astra with the priority service tier.
